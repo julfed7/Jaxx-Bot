@@ -30,9 +30,63 @@ def init_db():
         avatar_url TEXT,
         PRIMARY KEY (user_id, guild_id, prefix)
     )""")
+    # Новая таблица — белый список каналов
+    c.execute("""CREATE TABLE IF NOT EXISTS allowed_channels (
+        guild_id INTEGER NOT NULL,
+        channel_id INTEGER NOT NULL,
+        PRIMARY KEY (guild_id, channel_id)
+    )""")
     conn.commit()
     conn.close()
 
+
+def is_channel_allowed(guild_id: int, channel_id: int) -> bool:
+    """Если список пуст — разрешено всё. Иначе — только каналы из списка."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM allowed_channels WHERE guild_id = ?", (guild_id,))
+    total = c.fetchone()[0]
+    if total == 0:
+        conn.close()
+        return True
+    c.execute(
+        "SELECT 1 FROM allowed_channels WHERE guild_id = ? AND channel_id = ?",
+        (guild_id, channel_id),
+    )
+    row = c.fetchone()
+    conn.close()
+    return row is not None
+
+
+def allow_channel(guild_id: int, channel_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "INSERT OR IGNORE INTO allowed_channels (guild_id, channel_id) VALUES (?, ?)",
+        (guild_id, channel_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def disallow_channel(guild_id: int, channel_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "DELETE FROM allowed_channels WHERE guild_id = ? AND channel_id = ?",
+        (guild_id, channel_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def list_allowed_channels(guild_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT channel_id FROM allowed_channels WHERE guild_id = ?", (guild_id,))
+    rows = [r[0] for r in c.fetchall()]
+    conn.close()
+    return rows
 
 def add_character(user_id, guild_id, name, prefix, avatar_url):
     conn = sqlite3.connect(DB_PATH)
@@ -113,17 +167,21 @@ async def on_ready():
     prefix="Префикс (например: -гигачад)",
     avatar="Картинка-аватар персонажа",
 )
-async def create_char(
-    interaction: discord.Interaction,
-    name: str,
-    prefix: str,
-    avatar: discord.Attachment,
-):
+async def create_char(interaction, name, prefix, avatar):
     if not interaction.guild:
         await interaction.response.send_message(
             "Команда работает только на сервере.", ephemeral=True
         )
         return
+
+    # Проверка белого списка каналов
+    if not is_channel_allowed(interaction.guild.id, interaction.channel.id):
+        await interaction.response.send_message(
+            "❌ В этом канале команды бота отключены.", ephemeral=True
+        )
+        return
+
+    # ... остальной код
 
     if not (avatar.content_type or "").startswith("image/"):
         await interaction.response.send_message(
@@ -153,6 +211,79 @@ async def create_char(
 
     await interaction.response.send_message(embed=embed)
 
+def is_admin(interaction: discord.Interaction) -> bool:
+    """Проверка: админ ли пользователь. Используется для команд управления каналами."""
+    perms = interaction.user.guild_permissions
+    return perms.administrator or perms.manage_guild
+
+
+@tree.command(name="jb_allow", description="Разрешить команды бота в этом канале (только админ)")
+async def jb_allow(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("Только на сервере.", ephemeral=True)
+        return
+    if not is_admin(interaction):
+        await interaction.response.send_message(
+            "❌ Нужны права администратора.", ephemeral=True
+        )
+        return
+
+    allow_channel(interaction.guild.id, interaction.channel.id)
+    await interaction.response.send_message(
+        f"✅ Канал {interaction.channel.mention} добавлен в белый список.\n"
+        f"Теперь команды бота работают **только** в каналах из списка.",
+        ephemeral=True,
+    )
+
+
+@tree.command(name="jb_disallow", description="Запретить команды бота в этом канале (только админ)")
+async def jb_disallow(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("Только на сервере.", ephemeral=True)
+        return
+    if not is_admin(interaction):
+        await interaction.response.send_message(
+            "❌ Нужны права администратора.", ephemeral=True
+        )
+        return
+
+    disallow_channel(interaction.guild.id, interaction.channel.id)
+    remaining = list_allowed_channels(interaction.guild.id)
+    msg = f"✅ Канал {interaction.channel.mention} убран из белого списка."
+    if not remaining:
+        msg += "\n⚠️ Список пуст — команды снова работают **во всех** каналах."
+    await interaction.response.send_message(msg, ephemeral=True)
+
+
+@tree.command(name="jb_channels", description="Показать, в каких каналах разрешены команды")
+async def jb_channels(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("Только на сервере.", ephemeral=True)
+        return
+
+    ids = list_allowed_channels(interaction.guild.id)
+
+    if not ids:
+        await interaction.response.send_message(
+            "📋 Белый список пуст — команды бота работают **во всех** каналах.",
+            ephemeral=True,
+        )
+        return
+
+    lines = []
+    for cid in ids:
+        ch = interaction.guild.get_channel(cid)
+        lines.append(ch.mention if ch else f"❓ `{cid}` (канал удалён)")
+
+    embed = discord.Embed(
+        title="📋 Каналы, где разрешены команды",
+        description="\n".join(lines),
+        color=0x5865F2,
+    )
+    embed.set_footer(text=f"Всего: {len(ids)}. Добавить — /jb_allow, убрать — /jb_disallow")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 
 # ---------- Ловим сообщения с префиксом ----------
 @bot.event
@@ -160,7 +291,12 @@ async def on_message(message: discord.Message):
     if message.author.bot or not message.guild or not message.content:
         return
 
+    # Проверка белого списка каналов
+    if not is_channel_allowed(message.guild.id, message.channel.id):
+        return
+
     match = find_by_prefix(message.content, message.guild.id)
+    # ... остальной код
     if not match:
         return
 

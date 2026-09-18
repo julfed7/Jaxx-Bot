@@ -74,7 +74,6 @@ def find_by_prefix(content, guild_id):
 
 
 def is_channel_allowed(guild_id: int, channel_id: int) -> bool:
-    """Если список пуст — разрешено всё. Иначе — только каналы из списка."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT COUNT(*) FROM allowed_channels WHERE guild_id = ?", (guild_id,))
@@ -314,7 +313,7 @@ async def on_message(message: discord.Message):
     try:
         await message.delete()
     except discord.Forbidden:
-        print("⚠️ Нет права Manage Messages в канале — не могу удалить сообщение")
+        print("⚠️ Нет права Manage Messages — не могу удалить сообщение")
     except discord.NotFound:
         print("⚠️ Сообщение уже удалено")
     except Exception as e:

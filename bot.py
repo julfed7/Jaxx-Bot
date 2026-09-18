@@ -41,25 +41,40 @@ if GIGA_KEY:
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+
     c.execute("""CREATE TABLE IF NOT EXISTS characters (
         user_id INTEGER NOT NULL,
         guild_id INTEGER NOT NULL,
         name TEXT NOT NULL,
         prefix TEXT NOT NULL,
         avatar_url TEXT,
-        history TEXT,
-        health INTEGER DEFAULT 100,
-        max_health INTEGER DEFAULT 100,
-        regen INTEGER DEFAULT 5,
-        inventory TEXT DEFAULT '[]',
-        skills TEXT DEFAULT '[]',
         PRIMARY KEY (user_id, guild_id, prefix)
     )""")
+
     c.execute("""CREATE TABLE IF NOT EXISTS allowed_channels (
         guild_id INTEGER NOT NULL,
         channel_id INTEGER NOT NULL,
         PRIMARY KEY (guild_id, channel_id)
     )""")
+
+    # --- МИГРАЦИЯ: добавляем новые колонки, если их нет ---
+    c.execute("PRAGMA table_info(characters)")
+    existing = {row[1] for row in c.fetchall()}
+
+    new_columns = {
+        "history":     "TEXT DEFAULT ''",
+        "health":      "INTEGER DEFAULT 100",
+        "max_health":  "INTEGER DEFAULT 100",
+        "regen":       "INTEGER DEFAULT 5",
+        "inventory":   "TEXT DEFAULT '[]'",
+        "skills":      "TEXT DEFAULT '[]'",
+    }
+
+    for col, ddl in new_columns.items():
+        if col not in existing:
+            c.execute(f"ALTER TABLE characters ADD COLUMN {col} {ddl}")
+            print(f"✅ Добавлена колонка: {col}")
+
     conn.commit()
     conn.close()
 

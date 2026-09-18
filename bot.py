@@ -6,7 +6,7 @@ from discord.ext import commands
 from dotenv import load_dotenv
 
 load_dotenv()
-TOKEN = os.getenv("MTU1MDM1MzE4NzAwNzg4OTU0OA.GLvFU7.clDibuqIh2utcxcMvs6cYZ3ND_XTRaFPRdsufQ")
+TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 DB_PATH = os.getenv("DB_PATH", "characters.db")
 
 intents = discord.Intents.default()

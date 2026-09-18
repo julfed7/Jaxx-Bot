@@ -1,0 +1,4 @@
+.env
+characters.db
+__pycache__/
+*.pyc

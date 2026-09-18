@@ -192,4 +192,22 @@ async def on_message(message: discord.Message):
 
 
 if __name__ == "__main__":
-    bot.run(TOKEN)
+    print("=== ПРОВЕРКА ТОКЕНА ===")
+    if not TOKEN:
+        print("❌ TOKEN = None или пустая строка!")
+        print("Значит Railway не видит переменную DISCORD_BOT_TOKEN.")
+        exit(1)
+
+    print(f"✅ Длина токена: {len(TOKEN)}")
+    print(f"✅ Первые 8 символов: {TOKEN[:8]}")
+    print(f"✅ Последние 4 символа: {TOKEN[-4:]}")
+    print(f"✅ Содержит пробелы: {' ' in TOKEN}")
+    print(f"✅ Содержит кавычки: {'\"' in TOKEN or chr(39) in TOKEN}")
+    print("=======================")
+
+    try:
+        bot.run(TOKEN)
+    except discord.errors.LoginFailure:
+        print("❌ Discord отклонил токен. Он недействителен — сбрось в Developer Portal.")
+    except Exception as e:
+        print(f"❌ Ошибка: {type(e).__name__}: {e}")

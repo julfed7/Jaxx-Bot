@@ -827,16 +827,79 @@ async def handle_message(message, prefix, text, owner_id, char_name, avatar_url)
     damage = int(result.get("damage") or 0)
     success = bool(result.get("success", True))
 
+    # Публикуем от имени персонажа
     try:
         await send_as_character(message.channel, char_name, avatar_url, text)
     except Exception as e:
         print(f"⚠️ Ошибка вебхука: {e}")
         return
 
+    # Удаляем исходное сообщение
     try:
         await message.delete()
     except Exception as e:
         print(f"⚠️ Ошибка удаления: {e}")
 
+    # Если это действие — публикуем описание от бота
     if is_action and narration:
-        embed
+        embed = discord.Embed(
+            description=f"🎲 **{narration}**",
+            color=0xE67E22 if success else 0xE74C3C,
+        )
+        embed.set_author(name=f"Мастер: {char_name}")
+        await message.channel.send(embed=embed)
+
+        # Если была цель и урон — применяем к цели
+        if target_name and damage > 0:
+            target_row = get_character(guild_id=guild_id, name=target_name)
+            if target_row:
+                new_hp = max(0, target_row["health"] - damage)
+                update_health(guild_id, target_row["name"], new_hp)
+                hp_embed = discord.Embed(
+                    title=f"⚔️ {target_row['name']} получает {damage} урона",
+                    description=f"Осталось HP: **{new_hp} / {target_row['max_health']}**",
+                    color=0xE74C3C,
+                )
+                if new_hp <= 0:
+                    hp_embed.description += "\n☠️ **Персонаж повержен!**"
+                await message.channel.send(embed=hp_embed)
+
+    # Логируем событие для памяти канала
+    log_action(
+        guild_id, message.channel.id, char_name, text,
+        narration or ("речь" if not is_action else "")
+    )
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot or not message.guild or not message.content:
+        return
+    if not is_channel_allowed(message.guild.id, message.channel.id):
+        return
+
+    match = find_by_prefix(message.content, message.guild.id)
+    if not match:
+        return
+
+    prefix, text, owner_id, char_name, avatar_url = match
+    if message.author.id != owner_id:
+        return
+    if not text:
+        return
+
+    try:
+        await handle_message(message, prefix, text, owner_id, char_name, avatar_url)
+    except Exception as e:
+        print(f"⚠️ Ошибка обработки: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+if __name__ == "__main__":
+    if not TOKEN:
+        print("❌ TOKEN пустой!")
+        exit(1)
+    if not GIGA_KEY:
+        print("⚠️ GIGACHAT_CREDENTIALS не задан.")
+    bot.run(TOKEN)

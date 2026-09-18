@@ -30,7 +30,6 @@ def init_db():
         avatar_url TEXT,
         PRIMARY KEY (user_id, guild_id, prefix)
     )""")
-    # Новая таблица — белый список каналов
     c.execute("""CREATE TABLE IF NOT EXISTS allowed_channels (
         guild_id INTEGER NOT NULL,
         channel_id INTEGER NOT NULL,
@@ -38,6 +37,40 @@ def init_db():
     )""")
     conn.commit()
     conn.close()
+
+
+def add_character(user_id, guild_id, name, prefix, avatar_url):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "INSERT OR REPLACE INTO characters (user_id, guild_id, name, prefix, avatar_url) VALUES (?, ?, ?, ?, ?)",
+        (user_id, guild_id, name, prefix, avatar_url),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_chars_for_guild(guild_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "SELECT prefix, user_id, name, avatar_url FROM characters WHERE guild_id = ?",
+        (guild_id,),
+    )
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def find_by_prefix(content, guild_id):
+    rows = get_chars_for_guild(guild_id)
+    rows.sort(key=lambda r: len(r[0]), reverse=True)
+    for prefix, user_id, name, avatar_url in rows:
+        if content == prefix:
+            return prefix, "", user_id, name, avatar_url
+        if content.startswith(prefix + " "):
+            return prefix, content[len(prefix):].strip(), user_id, name, avatar_url
+    return None
 
 
 def is_channel_allowed(guild_id: int, channel_id: int) -> bool:
@@ -88,51 +121,15 @@ def list_allowed_channels(guild_id: int):
     conn.close()
     return rows
 
-def add_character(user_id, guild_id, name, prefix, avatar_url):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(
-        "INSERT OR REPLACE INTO characters (user_id, guild_id, name, prefix, avatar_url) VALUES (?, ?, ?, ?, ?)",
-        (user_id, guild_id, name, prefix, avatar_url),
-    )
-    conn.commit()
-    conn.close()
-
-
-def get_chars_for_guild(guild_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(
-        "SELECT prefix, user_id, name, avatar_url FROM characters WHERE guild_id = ?",
-        (guild_id,),
-    )
-    rows = c.fetchall()
-    conn.close()
-    return rows
-
-
-def find_by_prefix(content, guild_id):
-    """Ищет самого подходящего персонажа по началу сообщения."""
-    rows = get_chars_for_guild(guild_id)
-    # Сортируем по длине префикса (убывание), чтобы длинные матчились первыми
-    rows.sort(key=lambda r: len(r[0]), reverse=True)
-    for prefix, user_id, name, avatar_url in rows:
-        if content == prefix:
-            return prefix, "", user_id, name, avatar_url
-        if content.startswith(prefix + " "):
-            return prefix, content[len(prefix):].strip(), user_id, name, avatar_url
-    return None
-
 
 # ---------- Вебхуки ----------
-_webhook_cache = {}  # channel_id -> Webhook
+_webhook_cache = {}
 
 
 async def get_webhook(channel: discord.TextChannel) -> discord.Webhook:
     if channel.id in _webhook_cache:
         return _webhook_cache[channel.id]
 
-    # Пробуем найти существующий вебхук нашего бота
     try:
         for wh in await channel.webhooks():
             if wh.name == "RP Bot" and wh.user and wh.user.id == bot.user.id:
@@ -148,6 +145,12 @@ async def get_webhook(channel: discord.TextChannel) -> discord.Webhook:
     return wh
 
 
+# ---------- Утилиты ----------
+def is_admin(interaction: discord.Interaction) -> bool:
+    perms = interaction.user.guild_permissions
+    return perms.administrator or perms.manage_guild
+
+
 # ---------- События ----------
 @bot.event
 async def on_ready():
@@ -160,28 +163,30 @@ async def on_ready():
     print(f"Бот {bot.user} готов!")
 
 
-# ---------- Слеш-команда ----------
+# ---------- Слеш-команда: создать персонажа ----------
 @tree.command(name="jb_create_char", description="Создать персонажа для ролевой игры")
 @app_commands.describe(
     name="Имя персонажа",
     prefix="Префикс (например: -гигачад)",
     avatar="Картинка-аватар персонажа",
 )
-async def create_char(interaction, name, prefix, avatar):
+async def create_char(
+    interaction: discord.Interaction,
+    name: str,
+    prefix: str,
+    avatar: discord.Attachment,
+):
     if not interaction.guild:
         await interaction.response.send_message(
             "Команда работает только на сервере.", ephemeral=True
         )
         return
 
-    # Проверка белого списка каналов
     if not is_channel_allowed(interaction.guild.id, interaction.channel.id):
         await interaction.response.send_message(
             "❌ В этом канале команды бота отключены.", ephemeral=True
         )
         return
-
-    # ... остальной код
 
     if not (avatar.content_type or "").startswith("image/"):
         await interaction.response.send_message(
@@ -211,12 +216,8 @@ async def create_char(interaction, name, prefix, avatar):
 
     await interaction.response.send_message(embed=embed)
 
-def is_admin(interaction: discord.Interaction) -> bool:
-    """Проверка: админ ли пользователь. Используется для команд управления каналами."""
-    perms = interaction.user.guild_permissions
-    return perms.administrator or perms.manage_guild
 
-
+# ---------- Слеш-команда: разрешить канал ----------
 @tree.command(name="jb_allow", description="Разрешить команды бота в этом канале (только админ)")
 async def jb_allow(interaction: discord.Interaction):
     if not interaction.guild:
@@ -236,6 +237,7 @@ async def jb_allow(interaction: discord.Interaction):
     )
 
 
+# ---------- Слеш-команда: запретить канал ----------
 @tree.command(name="jb_disallow", description="Запретить команды бота в этом канале (только админ)")
 async def jb_disallow(interaction: discord.Interaction):
     if not interaction.guild:
@@ -255,6 +257,7 @@ async def jb_disallow(interaction: discord.Interaction):
     await interaction.response.send_message(msg, ephemeral=True)
 
 
+# ---------- Слеш-команда: показать список каналов ----------
 @tree.command(name="jb_channels", description="Показать, в каких каналах разрешены команды")
 async def jb_channels(interaction: discord.Interaction):
     if not interaction.guild:
@@ -284,26 +287,21 @@ async def jb_channels(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-
 # ---------- Ловим сообщения с префиксом ----------
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot or not message.guild or not message.content:
         return
 
-    # Проверка белого списка каналов
     if not is_channel_allowed(message.guild.id, message.channel.id):
         return
 
     match = find_by_prefix(message.content, message.guild.id)
-    # ... остальной код
     if not match:
         return
 
     prefix, text, owner_id, char_name, avatar_url = match
 
-    # Ограничение: только владелец персонажа может за него говорить.
-    # Если хочешь разрешить всем — закомментируй эти 2 строки.
     if message.author.id != owner_id:
         return
 
@@ -313,37 +311,24 @@ async def on_message(message: discord.Message):
         await message.channel.send(f"⚠️ {e}")
         return
 
-    # Удаляем оригинальное сообщение
     try:
         await message.delete()
-    except (discord.Forbidden, discord.NotFound):
-        pass
+    except discord.Forbidden:
+        print("⚠️ Нет права Manage Messages в канале — не могу удалить сообщение")
+    except discord.NotFound:
+        print("⚠️ Сообщение уже удалено")
+    except Exception as e:
+        print(f"⚠️ Ошибка удаления: {type(e).__name__}: {e}")
 
-    # Отправляем от имени персонажа через вебхук
     if text:
         await webhook.send(content=text, username=char_name, avatar_url=avatar_url)
     else:
-        # Пустой текст — отправим одну картинку-аватар или что-то ещё, если нужно
         await webhook.send(content="…", username=char_name, avatar_url=avatar_url)
 
 
+# ---------- Запуск ----------
 if __name__ == "__main__":
-    print("=== ПРОВЕРКА ТОКЕНА ===")
     if not TOKEN:
-        print("❌ TOKEN = None или пустая строка!")
-        print("Значит Railway не видит переменную DISCORD_BOT_TOKEN.")
+        print("❌ TOKEN пустой!")
         exit(1)
-
-    print(f"✅ Длина токена: {len(TOKEN)}")
-    print(f"✅ Первые 8 символов: {TOKEN[:8]}")
-    print(f"✅ Последние 4 символа: {TOKEN[-4:]}")
-    print(f"✅ Содержит пробелы: {' ' in TOKEN}")
-    print(f"✅ Содержит кавычки: {'\"' in TOKEN or chr(39) in TOKEN}")
-    print("=======================")
-
-    try:
-        bot.run(TOKEN)
-    except discord.errors.LoginFailure:
-        print("❌ Discord отклонил токен. Он недействителен — сбрось в Developer Portal.")
-    except Exception as e:
-        print(f"❌ Ошибка: {type(e).__name__}: {e}")
+    bot.run(TOKEN)

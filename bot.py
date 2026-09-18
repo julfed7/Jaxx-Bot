@@ -120,16 +120,18 @@ def init_db():
     c.execute("PRAGMA table_info(characters)")
     existing = {row[1] for row in c.fetchall()}
     new_columns = {
-        "history":        "TEXT DEFAULT ''",
-        "health":         "INTEGER DEFAULT 100",
-        "max_health":     "INTEGER DEFAULT 100",
-        "regen":          "INTEGER DEFAULT 100",
-        "inventory":      "TEXT DEFAULT '[]'",
-        "skills":         "TEXT DEFAULT '[]'",
-        "personality":    "TEXT DEFAULT ''",
-        "is_bot":         "INTEGER DEFAULT 0",
-        "npc_channel_id": "INTEGER DEFAULT NULL",
-        "npc_last_spoke": "REAL DEFAULT 0",
+    	"history":         "TEXT DEFAULT ''",
+    	"health":          "INTEGER DEFAULT 100",
+    	"max_health":      "INTEGER DEFAULT 100",
+    	"regen":           "INTEGER DEFAULT 100",
+    	"inventory":       "TEXT DEFAULT '[]'",
+    	"skills":          "TEXT DEFAULT '[]'",
+    	"personality":     "TEXT DEFAULT ''",
+    	"is_bot":          "INTEGER DEFAULT 0",
+    	"npc_channel_id":  "INTEGER DEFAULT NULL",
+    	"npc_last_spoke":  "REAL DEFAULT 0",
+    	"npc_last_moved":  "REAL DEFAULT 0",
+    	"npc_talk_count":  "INTEGER DEFAULT 0",
     }
     for col, ddl in new_columns.items():
         if col not in existing:
@@ -357,6 +359,116 @@ def update_npc_spoke(guild_id, prefix):
     conn.commit()
     conn.close()
 
+def update_npc_moved(guild_id, prefix):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "UPDATE characters SET npc_last_moved=?, npc_talk_count=0 WHERE guild_id=? AND prefix=?",
+        (time.time(), guild_id, prefix),
+    )
+    conn.commit()
+    conn.close()
+
+
+def increment_talk_count(guild_id, prefix):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "UPDATE characters SET npc_talk_count = npc_talk_count + 1 WHERE guild_id=? AND prefix=?",
+        (guild_id, prefix),
+    )
+    conn.commit()
+    conn.close()
+
+
+def reset_talk_count(guild_id, prefix):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "UPDATE characters SET npc_talk_count=0 WHERE guild_id=? AND prefix=?",
+        (guild_id, prefix),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_npcs_in_channel(guild_id, channel_id):
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute(
+        "SELECT * FROM characters WHERE guild_id=? AND is_bot=1 AND npc_channel_id=?",
+        (guild_id, channel_id),
+    )
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def get_neighbor_channels(guild, current_channel):
+    """
+    Возвращает список соседних текстовых каналов:
+    каналы из той же категории по порядку ± 1,
+    плюс первые каналы из соседних категорий.
+    """
+    neighbors = []
+    if not current_channel:
+        return neighbors
+
+    category = current_channel.category
+    if category:
+        text_channels = [ch for ch in category.channels if isinstance(ch, discord.TextChannel)]
+        try:
+            idx = text_channels.index(current_channel)
+        except ValueError:
+            idx = -1
+        if idx >= 0:
+            if idx - 1 >= 0:
+                neighbors.append(text_channels[idx - 1])
+            if idx + 1 < len(text_channels):
+                neighbors.append(text_channels[idx + 1])
+    else:
+        # без категории — берём ±1 среди всех текстовых каналов гильдии
+        text_channels = [ch for ch in guild.text_channels]
+        try:
+            idx = text_channels.index(current_channel)
+        except ValueError:
+            idx = -1
+        if idx >= 0:
+            if idx - 1 >= 0:
+                neighbors.append(text_channels[idx - 1])
+            if idx + 1 < len(text_channels):
+                neighbors.append(text_channels[idx + 1])
+
+    return neighbors
+
+
+def get_teleport_targets(guild, current_channel):
+    """Каналы в других категориях — цель для телепорта."""
+    targets = []
+    current_cat = current_channel.category if current_channel else None
+    for ch in guild.text_channels:
+        if ch == current_channel:
+            continue
+        if ch.category != current_cat:
+            targets.append(ch)
+    return targets
+
+
+def has_teleport_ability(inventory, skills):
+    """Проверяет, есть ли телепортатор в инвентаре или навык телепортации."""
+    teleport_items = ["телепорт", "портал", "телепортатор", "кристалл перемещения"]
+    teleport_skills = ["телепортация", "телепорт", "пространственная магия", "портал"]
+    inv_lower = " ".join(inventory).lower()
+    skills_lower = " ".join(skills).lower()
+    for item in teleport_items:
+        if item in inv_lower:
+            return True
+    for skill in teleport_skills:
+        if skill in skills_lower:
+            return True
+    return False
+
 
 # Каналы
 def is_channel_allowed(guild_id, channel_id):
@@ -566,6 +678,118 @@ async def npc_think(npc_name, npc_history, npc_personality, npc_skills, npc_inve
     print("=== NPC RAW ===", repr(raw))
     return parse_json_safe(raw, {"text": "", "is_action": False})
 
+async def npc_decide_movement(npc_name, npc_personality, npc_history,
+                              current_channel_name, neighbors_info,
+                              can_teleport, context_log):
+    """
+    Возвращает: {"move": "stay"/"neighbor"/"teleport", "target": "имя канала или null",
+                 "reason": "короткое описание действия при переходе"}
+    """
+    if not giga:
+        return {"move": "stay", "target": None, "reason": ""}
+
+    context_str = "\n".join(
+        f"{a}: {c}" for a, c, r in context_log
+    ) if context_log else "нет недавних сообщений"
+
+    neigh_str = "\n".join(f"- {n}" for n in neighbors_info) if neighbors_info else "нет"
+
+    teleport_str = "можешь телепортироваться в любой канал" if can_teleport else "телепорт недоступен"
+
+    system = (
+        "Ты — персонаж RPG. Ты решаешь, куда пойти. Отвечай ТОЛЬКО валидным JSON. "
+        "Никаких пояснений.\n\n"
+        "ПРАВИЛА:\n"
+        "1. Обычно ты ОСТАЁШЬСЯ (move=stay).\n"
+        "2. Иногда можешь перейти в СОСЕДНИЙ канал (move=neighbor), "
+        "если это логично по истории.\n"
+        "3. Телепорт (move=teleport) — только если он у тебя есть и это важно.\n"
+        "4. Причина — короткое описание, что ты делаешь при переходе "
+        "(например: 'направился в кузницу').\n"
+    )
+
+    user = (
+        f"Персонаж: {npc_name}\n"
+        f"Характер: {npc_personality}\n"
+        f"История: {npc_history}\n\n"
+        f"Сейчас ты в канале: {current_channel_name}\n"
+        f"Последние события:\n{context_str}\n\n"
+        f"Соседние каналы:\n{neigh_str}\n"
+        f"Телепорт: {teleport_str}\n\n"
+        "Верни JSON:\n"
+        "{\n"
+        '  "move": "stay" | "neighbor" | "teleport",\n'
+        '  "target": "название канала или null",\n'
+        '  "reason": "короткое описание действия"\n'
+        "}"
+    )
+
+    raw = await giga_chat_async(
+        [
+            Messages(role=MessagesRole.SYSTEM, content=system),
+            Messages(role=MessagesRole.USER, content=user),
+        ],
+        max_tokens=200,
+        temperature=0.7,
+    )
+    print("=== MOVE RAW ===", repr(raw))
+    return parse_json_safe(raw, {"move": "stay", "target": None, "reason": ""})
+
+async def npc_react_to_npc(npc_name, npc_personality, npc_history, npc_skills, npc_inventory,
+                           other_npc_name, other_npc_message, context_log):
+    """
+    NPC реагирует на сообщение другого NPC.
+    Возвращает: {"text": "...", "is_action": true/false, "attack": true/false, "target": "имя"}
+    """
+    if not giga:
+        return {"text": "", "is_action": False, "attack": False, "target": None}
+
+    skills_str = ", ".join(npc_skills) if npc_skills else "нет"
+    inv_str = ", ".join(npc_inventory) if npc_inventory else "пусто"
+
+    context_str = "\n".join(
+        f"{a}: {c}" for a, c, r in context_log
+    ) if context_log else "нет событий"
+
+    system = (
+        "Ты — персонаж RPG. Другой персонаж обратился к тебе или что-то сделал. "
+        "Реши, как ответить. Отвечай ТОЛЬКО валидным JSON.\n\n"
+        "ПРАВИЛА:\n"
+        "1. Обычно ты просто отвечаешь коротко (is_action=false).\n"
+        "2. Если тебе что-то не понравилось — можешь атаковать (attack=true, "
+        "is_action=true, target='имя').\n"
+        "3. Не пиши длинных монологов. 1-2 предложения.\n"
+        "4. Действуй в характере.\n"
+    )
+
+    user = (
+        f"Ты: {npc_name} ({npc_personality})\n"
+        f"История: {npc_history}\n"
+        f"Навыки: {skills_str}\n"
+        f"Инвентарь: {inv_str}\n\n"
+        f"Недавние события:\n{context_str}\n\n"
+        f"Другой персонаж **{other_npc_name}** сказал/сделал:\n"
+        f"> {other_npc_message}\n\n"
+        "Верни JSON:\n"
+        "{\n"
+        '  "text": "твой ответ",\n'
+        '  "is_action": true/false,\n'
+        '  "attack": true/false,\n'
+        '  "target": "имя или null"\n'
+        "}"
+    )
+
+    raw = await giga_chat_async(
+        [
+            Messages(role=MessagesRole.SYSTEM, content=system),
+            Messages(role=MessagesRole.USER, content=user),
+        ],
+        max_tokens=200,
+        temperature=0.8,
+    )
+    print("=== NPC↔NPC RAW ===", repr(raw))
+    return parse_json_safe(raw, {"text": "", "is_action": False, "attack": False, "target": None})
+
 
 # ---------- Вебхуки ----------
 _webhook_cache = {}
@@ -603,6 +827,74 @@ async def regen_task():
 async def before_regen():
     await bot.wait_until_ready()
 
+async def process_npc_dialog(guild, channel, group):
+    """Если в канале 2+ NPC, они могут общаться друг с другом."""
+    # Сортируем по времени последнего сообщения
+    group_sorted = sorted(group, key=lambda r: r["npc_last_spoke"] or 0, reverse=True)
+
+    # Инициатор — тот, кто говорил последним
+    last_speaker = group_sorted[0]
+    others = group_sorted[1:]
+
+    now = time.time()
+    last_spoke = last_speaker["npc_last_spoke"] or 0
+    if now - last_spoke > 60:
+        return  # давно никто не говорил, не начинаем
+
+    # Случайный «ответчик» из остальных
+    responder = random.choice(others)
+
+    # Не даём зацикливаться
+    if (responder["npc_talk_count"] or 0) >= 5:
+        return
+    if random.random() > 0.15:  # 15% шанс ответа за тик
+        return
+
+    context = get_recent_log(guild.id, channel.id, limit=10)
+    history = responder["history"] or ""
+    personality = responder["personality"] or ""
+    skills = json.loads(responder["skills"] or "[]")
+    inventory = json.loads(responder["inventory"] or "[]")
+
+    last_msg = last_speaker["name"]
+    # Находим последнее сообщение этого NPC в логе
+    last_text = ""
+    for author, content, result in reversed(context):
+        if author == last_msg:
+            last_text = content
+            break
+
+    result = await npc_react_to_npc(
+        responder["name"], personality, history, skills, inventory,
+        last_speaker["name"], last_text, context,
+    )
+
+    text = (result.get("text") or "").strip()
+    if not text:
+        return
+
+    is_attack = bool(result.get("attack"))
+    target_name = result.get("target") if is_attack else None
+
+    await npc_speak(guild, responder, text, bool(result.get("is_action")))
+    increment_talk_count(guild.id, responder["prefix"])
+
+    # Если атакует — применяем урон
+    if is_attack and target_name:
+        target_row = get_character(guild_id=guild.id, name=target_name)
+        if target_row:
+            damage = random.randint(20, 150)
+            new_hp = max(0, target_row["health"] - damage)
+            update_health(guild.id, target_row["name"], new_hp)
+            hp_embed = discord.Embed(
+                title=f"⚔️ {target_row['name']} получает {damage} урона",
+                description=f"Осталось HP: **{new_hp} / {target_row['max_health']}**",
+                color=0xE74C3C,
+            )
+            if new_hp <= 0:
+                hp_embed.description += "\n☠️ **Персонаж повержен!**"
+            await channel.send(embed=hp_embed)
+
 
 @tasks.loop(seconds=30)
 async def npc_life_task():
@@ -612,61 +904,149 @@ async def npc_life_task():
             if not npcs:
                 continue
 
+            # Для каждого канала — свой процесс
+            channel_groups = {}
             for row in npcs:
-                now = time.time()
-                channel = guild.get_channel(row["npc_channel_id"])
+                ch_id = row["npc_channel_id"]
+                if ch_id not in channel_groups:
+                    channel_groups[ch_id] = []
+                channel_groups[ch_id].append(row)
+
+            for ch_id, group in channel_groups.items():
+                channel = guild.get_channel(ch_id)
                 if not channel:
                     continue
 
-                last_spoke = row["npc_last_spoke"] or 0
-                seconds_since_spoke = now - last_spoke
+                # 1. Общение NPC↔NPC, если в канале больше одного
+                if len(group) >= 2:
+                    await process_npc_dialog(guild, channel, group)
 
-                last_human = get_last_human_message_time(guild.id, channel.id, row["name"])
-                seconds_since_human = now - last_human if last_human else 99999
+                # 2. Индивидуальная логика каждого NPC
+                for row in group:
+                    now = time.time()
+                    last_spoke = row["npc_last_spoke"] or 0
+                    seconds_since_spoke = now - last_spoke
+                    last_moved = row["npc_last_moved"] or 0
+                    seconds_since_moved = now - last_moved
+                    talk_count = row["npc_talk_count"] or 0
 
-                # Активная переписка
-                if seconds_since_human < 180 and seconds_since_spoke > 8:
-                    context = get_recent_log(guild.id, channel.id, limit=15)
-                    history = row["history"] or ""
-                    personality = row["personality"] or ""
-                    skills = json.loads(row["skills"] or "[]")
-                    inventory = json.loads(row["inventory"] or "[]")
-
-                    result = await npc_think(
-                        row["name"], history, personality, skills, inventory,
-                        context, is_reply_to_human=True,
-                    )
-                    text = (result.get("text") or "").strip()
-                    if text:
-                        await npc_speak(guild, row, text, bool(result.get("is_action")))
-                    continue
-
-                # Пассивный режим
-                if seconds_since_human > 300 and seconds_since_spoke > 300:
-                    if random.random() > 0.03:
+                    # Проверка на зацикливание: если NPC наговорил 5+ раз без человека — молчим
+                    if talk_count >= 5:
+                        # Сброс через 10 минут
+                        if seconds_since_spoke > 600:
+                            reset_talk_count(guild.id, row["prefix"])
                         continue
 
-                    context = get_recent_log(guild.id, channel.id, limit=15)
-                    history = row["history"] or ""
-                    personality = row["personality"] or ""
-                    skills = json.loads(row["skills"] or "[]")
-                    inventory = json.loads(row["inventory"] or "[]")
+                    last_human = get_last_human_message_time(guild.id, channel.id, row["name"])
+                    seconds_since_human = now - last_human if last_human else 99999
 
-                    result = await npc_think(
-                        row["name"], history, personality, skills, inventory,
-                        context, is_reply_to_human=False,
-                    )
-                    text = (result.get("text") or "").strip()
-                    if text:
-                        await npc_speak(guild, row, text, bool(result.get("is_action")))
+                    # Раз в час — попытка перехода (только если человек не писал последние 5 минут)
+                    if seconds_since_moved > 3600 and seconds_since_human > 300:
+                        if random.random() < 0.4:  # 40% что попробует перейти
+                            moved = await try_npc_move(guild, row, channel)
+                            if moved:
+                                continue
+
+                    # Активная переписка
+                    if seconds_since_human < 180 and seconds_since_spoke > 8:
+                        context = get_recent_log(guild.id, channel.id, limit=15)
+                        history = row["history"] or ""
+                        personality = row["personality"] or ""
+                        skills = json.loads(row["skills"] or "[]")
+                        inventory = json.loads(row["inventory"] or "[]")
+
+                        result = await npc_think(
+                            row["name"], history, personality, skills, inventory,
+                            context, is_reply_to_human=True,
+                        )
+                        text = (result.get("text") or "").strip()
+                        if text:
+                            await npc_speak(guild, row, text, bool(result.get("is_action")))
+                            increment_talk_count(guild.id, row["prefix"])
+                        continue
+
+                    # Пассивный режим
+                    if seconds_since_human > 300 and seconds_since_spoke > 300:
+                        if random.random() > 0.03:
+                            continue
+
+                        context = get_recent_log(guild.id, channel.id, limit=15)
+                        history = row["history"] or ""
+                        personality = row["personality"] or ""
+                        skills = json.loads(row["skills"] or "[]")
+                        inventory = json.loads(row["inventory"] or "[]")
+
+                        result = await npc_think(
+                            row["name"], history, personality, skills, inventory,
+                            context, is_reply_to_human=False,
+                        )
+                        text = (result.get("text") or "").strip()
+                        if text:
+                            await npc_speak(guild, row, text, bool(result.get("is_action")))
+                            increment_talk_count(guild.id, row["prefix"])
 
     except Exception as e:
         print(f"⚠️ Ошибка npc_life_task: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 @npc_life_task.before_loop
 async def before_npc_life():
     await bot.wait_until_ready()
+
+async def try_npc_move(guild, row, current_channel):
+    """NPC решает, переходить ли в другой канал. Возвращает True, если перешёл."""
+    neighbors = get_neighbor_channels(guild, current_channel)
+    inventory = json.loads(row["inventory"] or "[]")
+    skills = json.loads(row["skills"] or "[]")
+    can_teleport = has_teleport_ability(inventory, skills)
+
+    teleport_targets = get_teleport_targets(guild, current_channel) if can_teleport else []
+
+    all_targets = []
+    for ch in neighbors:
+        all_targets.append(f"[соседний] {ch.name}")
+    for ch in teleport_targets[:5]:
+        all_targets.append(f"[телепорт] {ch.name}")
+
+    if not all_targets:
+        return False
+
+    context = get_recent_log(guild.id, current_channel.id, limit=10)
+
+    result = await npc_decide_movement(
+        row["name"], row["personality"] or "", row["history"] or "",
+        current_channel.name, all_targets, can_teleport, context,
+    )
+
+    move = result.get("move", "stay")
+    target_name = result.get("target")
+    reason = (result.get("reason") or "").strip()
+
+    if move == "stay" or not target_name:
+        # Обновим только таймер, чтобы не дёргать каждый тик
+        update_npc_moved(guild.id, row["prefix"])
+        return False
+
+    # Ищем канал
+    target = None
+    for ch in neighbors + teleport_targets:
+        if ch.name.lower() == target_name.lower():
+            target = ch
+            break
+
+    if not target:
+        update_npc_moved(guild.id, row["prefix"])
+        return False
+
+    # Телепорт разрешён только если can_teleport
+    if move == "teleport" and not can_teleport:
+        update_npc_moved(guild.id, row["prefix"])
+        return False
+
+    await npc_move(guild, row, target, reason)
+    return True
 
 
 # ---------- События ----------
@@ -1094,6 +1474,54 @@ async def npc_speak(guild, row, text, is_action):
     log_action(
         guild.id, channel_id, row["name"], text,
         "npc_action" if is_action else "npc_speech",
+    )
+    
+    
+async def npc_move(guild, row, target_channel, reason):
+    """NPC переходит из текущего канала в целевой."""
+    current_channel = guild.get_channel(row["npc_channel_id"])
+    if not current_channel:
+        return
+
+    # Прощальное сообщение в старом канале
+    if reason:
+        try:
+            await send_as_character(
+                current_channel, row["name"], row["avatar_url"],
+                f"*{reason}*",
+            )
+        except Exception as e:
+            print(f"⚠️ Ошибка прощания: {e}")
+
+    # Обновляем канал
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "UPDATE characters SET npc_channel_id=?, npc_last_moved=?, npc_talk_count=0 "
+        "WHERE guild_id=? AND prefix=?",
+        (target_channel.id, time.time(), guild.id, row["prefix"]),
+    )
+    conn.commit()
+    conn.close()
+
+    # Приветствие в новом канале
+    try:
+        await send_as_character(
+            target_channel, row["name"], row["avatar_url"],
+            f"*вошёл в {target_channel.name}*",
+        )
+    except Exception as e:
+        print(f"⚠️ Ошибка приветствия: {e}")
+
+    log_action(
+        guild.id, current_channel.id, row["name"],
+        f"ушёл из {current_channel.name}",
+        f"→ {target_channel.name}",
+    )
+    log_action(
+        guild.id, target_channel.id, row["name"],
+        f"пришёл в {target_channel.name}",
+        "npc_move",
     )
 
 

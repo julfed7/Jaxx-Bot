@@ -455,13 +455,14 @@ async def handle_action(message, prefix, text, owner_id, char_name, avatar_url, 
     row = get_character(owner_id, guild_id, prefix=prefix)
     if not row:
         return
-    # row: id, user_id, guild_id, name, prefix, avatar_url, history, health, max_health, regen, inventory, skills
-    history = row[6] or ""
-    health = row[7]
-    max_health = row[8]
-    regen = row[9]
-    inventory = json.loads(row[10] or "[]")
-    skills = json.loads(row[11] or "[]")
+
+    # Порядок колонок: user_id, guild_id, name, prefix, avatar_url, history, health, max_health, regen, inventory, skills
+    history    = row[5] or ""
+    health     = row[6]
+    max_health = row[7]
+    regen      = row[8]
+    inventory  = json.loads(row[9]  or "[]")
+    skills     = json.loads(row[10] or "[]")
 
     # Если текст начинается с передачи предмета
     if text.lower().startswith("передал") or text.lower().startswith("отдал"):

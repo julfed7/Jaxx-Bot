@@ -1,6 +1,8 @@
 import os
 import json
 import re
+import time
+import random
 import sqlite3
 import asyncio
 import discord
@@ -9,6 +11,7 @@ from discord.ext import commands, tasks
 from dotenv import load_dotenv
 from gigachat import GigaChat
 from gigachat.models import Chat, Messages, MessagesRole
+from datetime import datetime, timezone
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
@@ -117,14 +120,16 @@ def init_db():
     c.execute("PRAGMA table_info(characters)")
     existing = {row[1] for row in c.fetchall()}
     new_columns = {
-        "history":      "TEXT DEFAULT ''",
-        "health":       "INTEGER DEFAULT 100",
-        "max_health":   "INTEGER DEFAULT 100",
-        "regen":        "INTEGER DEFAULT 100",
-        "inventory":    "TEXT DEFAULT '[]'",
-        "skills":       "TEXT DEFAULT '[]'",
-        "personality":  "TEXT DEFAULT ''",
-        "is_bot":       "INTEGER DEFAULT 0",
+        "history":        "TEXT DEFAULT ''",
+        "health":         "INTEGER DEFAULT 100",
+        "max_health":     "INTEGER DEFAULT 100",
+        "regen":          "INTEGER DEFAULT 100",
+        "inventory":      "TEXT DEFAULT '[]'",
+        "skills":         "TEXT DEFAULT '[]'",
+        "personality":    "TEXT DEFAULT ''",
+        "is_bot":         "INTEGER DEFAULT 0",
+        "npc_channel_id": "INTEGER DEFAULT NULL",
+        "npc_last_spoke": "REAL DEFAULT 0",
     }
     for col, ddl in new_columns.items():
         if col not in existing:
@@ -166,11 +171,19 @@ def get_character(user_id=None, guild_id=None, prefix=None, name=None):
             "SELECT * FROM characters WHERE user_id=? AND guild_id=? AND prefix=?",
             (user_id, guild_id, prefix),
         )
+    elif prefix and guild_id:
+        c.execute(
+            "SELECT * FROM characters WHERE guild_id=? AND prefix=?",
+            (guild_id, prefix),
+        )
     elif name and guild_id:
         c.execute(
             "SELECT * FROM characters WHERE guild_id=? AND name=? COLLATE NOCASE",
             (guild_id, name),
         )
+    else:
+        conn.close()
+        return None
     row = c.fetchone()
     conn.close()
     return row
@@ -264,7 +277,7 @@ def log_action(guild_id, channel_id, author_name, content, result):
     conn.close()
 
 
-def get_recent_log(guild_id, channel_id, limit=10):
+def get_recent_log(guild_id, channel_id, limit=15):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
@@ -277,6 +290,75 @@ def get_recent_log(guild_id, channel_id, limit=10):
     return list(reversed(rows))
 
 
+def get_last_human_message_time(guild_id, channel_id, npc_name):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "SELECT timestamp FROM action_log "
+        "WHERE guild_id=? AND channel_id=? AND author_name!=? "
+        "ORDER BY id DESC LIMIT 1",
+        (guild_id, channel_id, npc_name),
+    )
+    row = c.fetchone()
+    conn.close()
+    if not row or not row[0]:
+        return 0
+    try:
+        dt = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return 0
+
+
+# NPC
+def set_npc(prefix, guild_id, channel_id, is_bot=True):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    if is_bot:
+        c.execute(
+            "UPDATE characters SET is_bot=1, npc_channel_id=?, npc_last_spoke=? "
+            "WHERE guild_id=? AND prefix=?",
+            (channel_id, time.time(), guild_id, prefix),
+        )
+    else:
+        c.execute(
+            "UPDATE characters SET is_bot=0, npc_channel_id=NULL WHERE guild_id=? AND prefix=?",
+            (guild_id, prefix),
+        )
+    conn.commit()
+    conn.close()
+
+
+def get_active_npcs(guild_id=None):
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    if guild_id:
+        c.execute(
+            "SELECT * FROM characters WHERE is_bot=1 AND guild_id=? AND npc_channel_id IS NOT NULL",
+            (guild_id,),
+        )
+    else:
+        c.execute(
+            "SELECT * FROM characters WHERE is_bot=1 AND npc_channel_id IS NOT NULL"
+        )
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def update_npc_spoke(guild_id, prefix):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "UPDATE characters SET npc_last_spoke=? WHERE guild_id=? AND prefix=?",
+        (time.time(), guild_id, prefix),
+    )
+    conn.commit()
+    conn.close()
+
+
+# Каналы
 def is_channel_allowed(guild_id, channel_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -329,9 +411,7 @@ async def generate_character_stats(name, history):
         f"Персонаж: {name}\nИстория: {history}\n\n"
         "Учитывай историю: если предмет сломан или утерян — не включай в инвентарь. "
         "Если персонаж сильный — дай больше HP. "
-        "Опиши характер персонажа в personality — одной фразой, "
-        "например: 'дерзкий и саркастичный', 'холодный и немногословный', "
-        "'весёлый и болтливый'. Характер должен вытекать из истории.\n\n"
+        "Опиши характер персонажа в personality — одной фразой.\n\n"
         "Сгенерируй:\n"
         "{\n"
         '  "health": <100-5000>,\n'
@@ -375,7 +455,7 @@ async def resolve_action(actor_name, actor_history, actor_personality,
     inv_str = ", ".join(actor_inventory) if actor_inventory else "пусто"
 
     context_str = "\n".join(
-        f"{a}: {c} → {r}" for a, c, r in context_log
+        f"{a}: {c}" + (f" → {r}" if r else "") for a, c, r in context_log
     ) if context_log else "нет недавних событий"
 
     targets_str = "\n".join(targets_info) if targets_info else "нет других персонажей"
@@ -427,6 +507,66 @@ async def resolve_action(actor_name, actor_history, actor_personality,
     })
 
 
+# ---------- GigaChat: NPC думает ----------
+async def npc_think(npc_name, npc_history, npc_personality, npc_skills, npc_inventory,
+                    context_log, is_reply_to_human):
+    if not giga:
+        return {"text": "", "is_action": False}
+
+    skills_str = ", ".join(npc_skills) if npc_skills else "нет"
+    inv_str = ", ".join(npc_inventory) if npc_inventory else "пусто"
+
+    context_str = "\n".join(
+        f"{a}: {c}" + (f" → {r}" if r else "") for a, c, r in context_log
+    ) if context_log else "нет недавних сообщений"
+
+    if is_reply_to_human:
+        mode = (
+            "Ты продолжаешь разговор. Ответь коротко и в характере, "
+            "как будто ты живой персонаж. Не описывай чужие действия."
+        )
+    else:
+        mode = (
+            "В канале давно тихо. Ты решаешь, чем заняться. "
+            "Напиши одно короткое действие или реплику от себя. "
+            "Можешь осмотреть комнату, что-то сказать, чем-то заняться."
+        )
+
+    system = (
+        "Ты — персонаж в текстовой RPG. Ты НЕ ассистент. "
+        "Ты живёшь в этом мире и ведёшь себя в соответствии со своим характером, "
+        "историей, навыками и инвентарём. Отвечай ТОЛЬКО валидным JSON.\n\n"
+        "ПРАВИЛА:\n"
+        "1. Сообщение должно быть коротким (1-2 предложения).\n"
+        "2. Никаких обращений к «игроку» или «пользователю» — ты в мире.\n"
+        "3. Если это действие — is_action=true, если просто реплика — false.\n"
+        "4. Учитывай характер и последние события в канале.\n"
+    )
+
+    user = (
+        f"Персонаж: {npc_name}\n"
+        f"Характер: {npc_personality}\n"
+        f"История: {npc_history}\n"
+        f"Навыки: {skills_str}\n"
+        f"Инвентарь: {inv_str}\n\n"
+        f"Последние сообщения в канале:\n{context_str}\n\n"
+        f"Задача: {mode}\n\n"
+        "Верни JSON:\n"
+        '{"text": "твоё сообщение", "is_action": true/false}'
+    )
+
+    raw = await giga_chat_async(
+        [
+            Messages(role=MessagesRole.SYSTEM, content=system),
+            Messages(role=MessagesRole.USER, content=user),
+        ],
+        max_tokens=200,
+        temperature=0.8,
+    )
+    print("=== NPC RAW ===", repr(raw))
+    return parse_json_safe(raw, {"text": "", "is_action": False})
+
+
 # ---------- Вебхуки ----------
 _webhook_cache = {}
 
@@ -464,6 +604,71 @@ async def before_regen():
     await bot.wait_until_ready()
 
 
+@tasks.loop(seconds=30)
+async def npc_life_task():
+    try:
+        for guild in bot.guilds:
+            npcs = get_active_npcs(guild.id)
+            if not npcs:
+                continue
+
+            for row in npcs:
+                now = time.time()
+                channel = guild.get_channel(row["npc_channel_id"])
+                if not channel:
+                    continue
+
+                last_spoke = row["npc_last_spoke"] or 0
+                seconds_since_spoke = now - last_spoke
+
+                last_human = get_last_human_message_time(guild.id, channel.id, row["name"])
+                seconds_since_human = now - last_human if last_human else 99999
+
+                # Активная переписка
+                if seconds_since_human < 180 and seconds_since_spoke > 8:
+                    context = get_recent_log(guild.id, channel.id, limit=15)
+                    history = row["history"] or ""
+                    personality = row["personality"] or ""
+                    skills = json.loads(row["skills"] or "[]")
+                    inventory = json.loads(row["inventory"] or "[]")
+
+                    result = await npc_think(
+                        row["name"], history, personality, skills, inventory,
+                        context, is_reply_to_human=True,
+                    )
+                    text = (result.get("text") or "").strip()
+                    if text:
+                        await npc_speak(guild, row, text, bool(result.get("is_action")))
+                    continue
+
+                # Пассивный режим
+                if seconds_since_human > 300 and seconds_since_spoke > 300:
+                    if random.random() > 0.03:
+                        continue
+
+                    context = get_recent_log(guild.id, channel.id, limit=15)
+                    history = row["history"] or ""
+                    personality = row["personality"] or ""
+                    skills = json.loads(row["skills"] or "[]")
+                    inventory = json.loads(row["inventory"] or "[]")
+
+                    result = await npc_think(
+                        row["name"], history, personality, skills, inventory,
+                        context, is_reply_to_human=False,
+                    )
+                    text = (result.get("text") or "").strip()
+                    if text:
+                        await npc_speak(guild, row, text, bool(result.get("is_action")))
+
+    except Exception as e:
+        print(f"⚠️ Ошибка npc_life_task: {type(e).__name__}: {e}")
+
+
+@npc_life_task.before_loop
+async def before_npc_life():
+    await bot.wait_until_ready()
+
+
 # ---------- События ----------
 @bot.event
 async def on_ready():
@@ -476,6 +681,9 @@ async def on_ready():
     if not regen_task.is_running():
         regen_task.start()
         print("🔄 Таск регенерации запущен (раз в час).")
+    if not npc_life_task.is_running():
+        npc_life_task.start()
+        print("🤖 Таск автономной жизни NPC запущен (каждые 30 сек).")
     print(f"Бот {bot.user} готов!")
 
 
@@ -623,7 +831,7 @@ async def jb_info(interaction: discord.Interaction, name: str = None):
 
 # ---------- /jb_delete_char ----------
 @tree.command(name="jb_delete_char", description="Удалить своего персонажа")
-@app_commands.describe(prefix="Префикс персонажа, которого хочешь удалить")
+@app_commands.describe(prefix="Префикс персонажа")
 async def jb_delete_char(interaction: discord.Interaction, prefix: str):
     if not interaction.guild:
         await interaction.response.send_message("Только на сервере.", ephemeral=True)
@@ -791,10 +999,102 @@ async def jb_regen(interaction: discord.Interaction):
     await interaction.response.send_message("🔄 Регенерация выполнена. Проверь логи.", ephemeral=True)
 
 
+# ---------- NPC команды ----------
+@tree.command(name="jb_set_bot", description="Сделать персонажа автономным NPC (только админ)")
+@app_commands.describe(prefix="Префикс персонажа")
+async def jb_set_bot(interaction: discord.Interaction, prefix: str):
+    if not interaction.guild or not is_admin(interaction):
+        await interaction.response.send_message("❌ Нужны права администратора.", ephemeral=True)
+        return
+
+    row = get_character(guild_id=interaction.guild.id, prefix=prefix)
+    if not row:
+        await interaction.response.send_message(f"Персонаж с префиксом `{prefix}` не найден.", ephemeral=True)
+        return
+
+    set_npc(prefix, interaction.guild.id, interaction.channel.id, is_bot=True)
+
+    embed = discord.Embed(
+        title="🤖 NPC активирован",
+        description=f"**{row['name']}** теперь живёт своей жизнью.",
+        color=0x9B59B6,
+    )
+    embed.add_field(name="🎭 Характер", value=row["personality"] or "—", inline=False)
+    embed.add_field(name="📍 Канал", value=interaction.channel.mention, inline=True)
+    embed.add_field(
+        name="⏱️ Логика",
+        value="Активная переписка + пассивные действия 5–60 мин",
+        inline=False,
+    )
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="jb_unset_bot", description="Выключить режим NPC (только админ)")
+@app_commands.describe(prefix="Префикс персонажа")
+async def jb_unset_bot(interaction: discord.Interaction, prefix: str):
+    if not interaction.guild or not is_admin(interaction):
+        await interaction.response.send_message("❌ Нужны права администратора.", ephemeral=True)
+        return
+
+    row = get_character(guild_id=interaction.guild.id, prefix=prefix)
+    if not row:
+        await interaction.response.send_message(f"Персонаж с префиксом `{prefix}` не найден.", ephemeral=True)
+        return
+
+    set_npc(prefix, interaction.guild.id, None, is_bot=False)
+    await interaction.response.send_message(
+        f"🛑 **{row['name']}** больше не NPC — управляется только игроком.", ephemeral=True
+    )
+
+
+@tree.command(name="jb_npc_status", description="Список активных NPC (только админ)")
+async def jb_npc_status(interaction: discord.Interaction):
+    if not interaction.guild or not is_admin(interaction):
+        await interaction.response.send_message("❌ Нужны права администратора.", ephemeral=True)
+        return
+
+    npcs = get_active_npcs(interaction.guild.id)
+    if not npcs:
+        await interaction.response.send_message("🤖 Активных NPC нет.", ephemeral=True)
+        return
+
+    now = time.time()
+    lines = []
+    for r in npcs:
+        ch = interaction.guild.get_channel(r["npc_channel_id"])
+        ch_str = ch.mention if ch else "❓ канал удалён"
+        since = int(now - (r["npc_last_spoke"] or 0))
+        lines.append(f"🤖 **{r['name']}** — {ch_str} — молчал {since} сек")
+
+    embed = discord.Embed(
+        title=f"🤖 Активные NPC ({len(npcs)})",
+        description="\n".join(lines),
+        color=0x9B59B6,
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 # ---------- Обработка сообщения ----------
 async def send_as_character(channel, name, avatar_url, text):
     webhook = await get_webhook(channel)
     await webhook.send(content=text, username=name, avatar_url=avatar_url)
+
+
+async def npc_speak(guild, row, text, is_action):
+    channel_id = row["npc_channel_id"]
+    channel = guild.get_channel(channel_id)
+    if not channel:
+        return
+    try:
+        await send_as_character(channel, row["name"], row["avatar_url"], text)
+    except Exception as e:
+        print(f"⚠️ NPC вебхук error: {e}")
+        return
+    update_npc_spoke(guild.id, row["prefix"])
+    log_action(
+        guild.id, channel_id, row["name"], text,
+        "npc_action" if is_action else "npc_speech",
+    )
 
 
 async def handle_message(message, prefix, text, owner_id, char_name, avatar_url):
@@ -827,20 +1127,17 @@ async def handle_message(message, prefix, text, owner_id, char_name, avatar_url)
     damage = int(result.get("damage") or 0)
     success = bool(result.get("success", True))
 
-    # Публикуем от имени персонажа
     try:
         await send_as_character(message.channel, char_name, avatar_url, text)
     except Exception as e:
         print(f"⚠️ Ошибка вебхука: {e}")
         return
 
-    # Удаляем исходное сообщение
     try:
         await message.delete()
     except Exception as e:
         print(f"⚠️ Ошибка удаления: {e}")
 
-    # Если это действие — публикуем описание от бота
     if is_action and narration:
         embed = discord.Embed(
             description=f"🎲 **{narration}**",
@@ -849,7 +1146,6 @@ async def handle_message(message, prefix, text, owner_id, char_name, avatar_url)
         embed.set_author(name=f"Мастер: {char_name}")
         await message.channel.send(embed=embed)
 
-        # Если была цель и урон — применяем к цели
         if target_name and damage > 0:
             target_row = get_character(guild_id=guild_id, name=target_name)
             if target_row:
@@ -864,7 +1160,6 @@ async def handle_message(message, prefix, text, owner_id, char_name, avatar_url)
                     hp_embed.description += "\n☠️ **Персонаж повержен!**"
                 await message.channel.send(embed=hp_embed)
 
-    # Логируем событие для памяти канала
     log_action(
         guild_id, message.channel.id, char_name, text,
         narration or ("речь" if not is_action else "")

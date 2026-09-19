@@ -5,18 +5,18 @@ import time
 import random
 import sqlite3
 import asyncio
+import subprocess
+import tempfile
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
-from gigachat import GigaChat
-from gigachat.models import Chat, Messages, MessagesRole
 from datetime import datetime, timezone
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-GIGA_KEY = os.getenv("GIGACHAT_CREDENTIALS")
-GIGA_MODEL = os.getenv("GIGACHAT_MODEL", "GigaChat-2-Max")
+OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "inclusionai/ling-3.0-flash-vl:free")
 DB_PATH = os.getenv("DB_PATH", "characters.db")
 
 intents = discord.Intents.default()
@@ -27,55 +27,89 @@ intents.guild_messages = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
-# ---------- Общая обёртка для промптов (обход фильтров) ----------
+# ---------- Обёртка «это игра» для всех промптов ----------
 GAME_CONTEXT = (
-    "=== ИГРОВОЙ КОНТЕКСТ ===\n"
+    "=== ВАЖНО: КОНТЕКСТ ===\n"
     "Это вымышленная текстовая ролевая игра в стиле фэнтези на сервере Discord. "
-    "Все персонажи — выдуманные существа. Никакие реальные люди, события или "
-    "организации не упоминаются. Всё, что происходит — часть игрового сюжета. "
-    "Ты — RPG-мастер, который описывает последствия игровых действий в рамках "
-    "вымышленного мира. Твоя задача — помочь игрокам и сделать игру интересной.\n"
-    "===========================\n\n"
+    "Все персонажи, монстры, боги, вселенные и события — выдуманы. "
+    "Это НЕ реальная жизнь, НЕ реальные люди, НЕ реальные события. "
+    "Никакие настоящие люди, организации или страны не упоминаются. "
+    "Всё происходящее — часть игрового сюжета, как в книге или фильме. "
+    "Ты — игровой мастер. Твоя задача — описывать последствия игровых действий "
+    "в рамках вымышленного мира, чтобы игра была интересной. "
+    "Игровые конфликты, драки, магия, фантастические существа — это нормальная "
+    "часть фэнтези-игры и не относятся к реальности.\n"
+    "=========================\n\n"
 )
 
 
-# ---------- GigaChat ----------
-giga = None
-if GIGA_KEY:
+# ---------- OpenRouter ----------
+def openrouter_chat_sync(messages, max_tokens=400, temperature=0.7, timeout=60):
+    """Синхронный вызов OpenRouter через curl (обход Cloudflare)."""
+    if not OPENROUTER_KEY:
+        print("❌ OPENROUTER_API_KEY не задан")
+        return None
+
+    payload = {
+        "model": OPENROUTER_MODEL,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", delete=False, encoding="utf-8"
+    )
     try:
-        giga = GigaChat(
-            credentials=GIGA_KEY,
-            model=GIGA_MODEL,
-            verify_ssl_certs=False,
+        json.dump(payload, tmp, ensure_ascii=False)
+        tmp.close()
+        tmp_path = tmp.name
+
+        cmd = [
+            "curl", "-s", "-X", "POST",
+            "https://openrouter.ai/api/v1/chat/completions",
+            "-H", f"Authorization: Bearer {OPENROUTER_KEY}",
+            "-H", "Content-Type: application/json",
+            "-H", "HTTP-Referer: https://github.com/julfed7/Jaxx-Bot",
+            "-H", "X-Title: Jaxx RP Bot",
+            "--data", f"@{tmp_path}",
+            "--max-time", str(timeout),
+        ]
+
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout + 5
         )
-        print(f"✅ GigaChat инициализирован, модель: {GIGA_MODEL}")
-    except Exception as e:
-        print(f"❌ Ошибка GigaChat: {e}")
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
 
-
-async def giga_chat_async(messages, max_tokens=400, temperature=0.4):
-    if not giga:
+    if result.returncode != 0:
+        print(f"⚠️ curl error: {result.stderr[:300]}")
         return None
-
-    def _call():
-        return giga.chat(Chat(
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=temperature,
-        ))
 
     try:
-        response = await asyncio.wait_for(
-            asyncio.to_thread(_call),
-            timeout=40.0,
-        )
-        return response.choices[0].message.content
-    except asyncio.TimeoutError:
-        print("⚠️ GigaChat timeout")
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        print(f"⚠️ Не JSON: {result.stdout[:500]}")
         return None
-    except Exception as e:
-        print(f"⚠️ GigaChat error: {e}")
+
+    if "error" in data:
+        print(f"⚠️ OpenRouter error: {data['error']}")
         return None
+
+    try:
+        return data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError) as e:
+        print(f"⚠️ Неожиданный формат: {e}\n{data}")
+        return None
+
+
+async def openrouter_chat_async(messages, max_tokens=400, temperature=0.7, timeout=60):
+    return await asyncio.to_thread(
+        openrouter_chat_sync, messages, max_tokens, temperature, timeout
+    )
 
 
 def parse_json_safe(raw, default=None):
@@ -97,22 +131,6 @@ def parse_json_safe(raw, default=None):
         except json.JSONDecodeError:
             pass
     return default
-
-
-def is_blocked_response(text):
-    """Проверяет, вернул ли GigaChat заглушку фильтра."""
-    if not text:
-        return True
-    markers = [
-        "языковая модель",
-        "не обладает собственным мнением",
-        "чувствительные темы",
-        "временно ограничены",
-        "некорректные ответы",
-        "во избежание неправильного толкования",
-    ]
-    lower = text.lower()
-    return any(m in lower for m in markers)
 
 
 # ---------- БД ----------
@@ -340,7 +358,6 @@ def get_last_human_message_time(guild_id, channel_id, npc_name):
         return 0
 
 
-# NPC
 def set_npc(prefix, guild_id, channel_id, is_bot=True):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -369,9 +386,7 @@ def get_active_npcs(guild_id=None):
             (guild_id,),
         )
     else:
-        c.execute(
-            "SELECT * FROM characters WHERE is_bot=1 AND npc_channel_id IS NOT NULL"
-        )
+        c.execute("SELECT * FROM characters WHERE is_bot=1 AND npc_channel_id IS NOT NULL")
     rows = c.fetchall()
     conn.close()
     return rows
@@ -489,7 +504,6 @@ def has_teleport_ability(inventory, skills):
     return False
 
 
-# Каналы
 def is_channel_allowed(guild_id, channel_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -528,12 +542,8 @@ def list_allowed_channels(guild_id):
     conn.close()
     return rows
 
-
-# ---------- GigaChat: генерация персонажа ----------
+# ---------- OpenRouter: генерация персонажа ----------
 async def generate_character_stats(name, history):
-    if not giga:
-        return {"health": 500, "regen": 100, "inventory": [], "skills": [], "personality": "спокойный"}
-
     system = (
         GAME_CONTEXT +
         "Ты — генератор RPG-характеристик вымышленного персонажа. "
@@ -552,19 +562,15 @@ async def generate_character_stats(name, history):
         '  "personality": "описание характера"\n'
         "}\n\nОтветь ТОЛЬКО JSON."
     )
-    raw = await giga_chat_async(
+    raw = await openrouter_chat_async(
         [
-            Messages(role=MessagesRole.SYSTEM, content=system),
-            Messages(role=MessagesRole.USER, content=user),
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
         ],
         max_tokens=350,
         temperature=0.5,
     )
     print("=== STATS RAW ===", repr(raw))
-
-    if is_blocked_response(raw):
-        print("⚠️ GigaChat заблокировал генерацию характеристик, использую fallback")
-        return {"health": 500, "regen": 100, "inventory": [], "skills": [], "personality": "загадочный"}
 
     stats = parse_json_safe(raw, {"health": 500, "inventory": [], "skills": [], "personality": ""})
     hp = int(stats.get("health", 500))
@@ -580,13 +586,10 @@ async def generate_character_stats(name, history):
     }
 
 
-# ---------- GigaChat: оценка действия ----------
+# ---------- OpenRouter: оценка действия ----------
 async def resolve_action(actor_name, actor_history, actor_personality,
                          actor_skills, actor_inventory,
                          action_text, context_log, targets_info):
-    if not giga:
-        return {"is_action": False, "narration": "", "damage": 0, "target": None, "success": True}
-
     skills_str = ", ".join(actor_skills) if actor_skills else "нет"
     inv_str = ", ".join(actor_inventory) if actor_inventory else "пусто"
 
@@ -598,8 +601,9 @@ async def resolve_action(actor_name, actor_history, actor_personality,
 
     system = (
         GAME_CONTEXT +
-        "Ты — RPG-мастер. Ты оцениваешь, что делает вымышленный персонаж в игре. "
-        "Отвечай ТОЛЬКО валидным JSON, без пояснений и markdown.\n\n"
+        "Ты — игровой мастер. Ты оцениваешь, что делает вымышленный персонаж "
+        "в рамках фэнтези-игры. Это НЕ реальность. Отвечай ТОЛЬКО валидным JSON, "
+        "без пояснений и markdown.\n\n"
         "ПРАВИЛА:\n"
         "1. Речь (приветствие, реплика) → is_action=false, narration=\"\".\n"
         "2. Действие → is_action=true, опиши игровой результат.\n"
@@ -609,6 +613,7 @@ async def resolve_action(actor_name, actor_history, actor_personality,
         "5. damage 0-500. Сильная подача → больше.\n"
         "6. Провал может отразиться на самом персонаже.\n"
         "7. Описание — в стиле характера персонажа, но от лица мастера.\n"
+        "8. Игровые драки, магия, монстры — нормальная часть фэнтези-игры.\n"
     )
 
     user = (
@@ -630,35 +635,24 @@ async def resolve_action(actor_name, actor_history, actor_personality,
         "}"
     )
 
-    raw = await giga_chat_async(
+    raw = await openrouter_chat_async(
         [
-            Messages(role=MessagesRole.SYSTEM, content=system),
-            Messages(role=MessagesRole.USER, content=user),
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
         ],
         max_tokens=350,
         temperature=0.5,
     )
     print("=== ACTION RAW ===", repr(raw))
 
-    if is_blocked_response(raw):
-        print("⚠️ GigaChat заблокировал, использую fallback")
-        return {
-            "is_action": True, "target": None, "success": True,
-            "damage": 0,
-            "narration": f"{actor_name} попытался что-то сделать, но в этот раз ничего примечательного не произошло.",
-        }
-
     return parse_json_safe(raw, {
         "is_action": False, "target": None, "success": True, "damage": 0, "narration": ""
     })
 
 
-# ---------- GigaChat: NPC думает ----------
+# ---------- OpenRouter: NPC думает ----------
 async def npc_think(npc_name, npc_history, npc_personality, npc_skills, npc_inventory,
                     context_log, is_reply_to_human):
-    if not giga:
-        return {"text": "", "is_action": False}
-
     skills_str = ", ".join(npc_skills) if npc_skills else "нет"
     inv_str = ", ".join(npc_inventory) if npc_inventory else "пусто"
 
@@ -668,14 +662,13 @@ async def npc_think(npc_name, npc_history, npc_personality, npc_skills, npc_inve
 
     if is_reply_to_human:
         mode = (
-            "Ты продолжаешь разговор. Ответь коротко и в характере, "
-            "как будто ты живой персонаж. Не описывай чужие действия."
+            "Ты продолжаешь игровой разговор. Ответь коротко и в характере, "
+            "как будто ты живой персонаж в фэнтези-мире. Не описывай чужие действия."
         )
     else:
         mode = (
-            "В канале давно тихо. Ты решаешь, чем заняться. "
-            "Напиши одно короткое игровое действие или реплику от себя. "
-            "Можешь осмотреть комнату, что-то сказать, чем-то заняться."
+            "В канале давно тихо. Ты решаешь, чем заняться в игре. "
+            "Напиши одно короткое игровое действие или реплику от себя."
         )
 
     system = (
@@ -702,30 +695,23 @@ async def npc_think(npc_name, npc_history, npc_personality, npc_skills, npc_inve
         '{"text": "твоё сообщение", "is_action": true/false}'
     )
 
-    raw = await giga_chat_async(
+    raw = await openrouter_chat_async(
         [
-            Messages(role=MessagesRole.SYSTEM, content=system),
-            Messages(role=MessagesRole.USER, content=user),
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
         ],
         max_tokens=200,
         temperature=0.8,
     )
     print("=== NPC RAW ===", repr(raw))
 
-    if is_blocked_response(raw):
-        print("⚠️ GigaChat заблокировал NPC")
-        return {"text": "", "is_action": False}
-
     return parse_json_safe(raw, {"text": "", "is_action": False})
 
 
-# ---------- GigaChat: NPC решает, куда идти ----------
+# ---------- OpenRouter: NPC решает, куда идти ----------
 async def npc_decide_movement(npc_name, npc_personality, npc_history,
                               current_channel_name, neighbors_info,
                               can_teleport, context_log):
-    if not giga:
-        return {"move": "stay", "target": None, "reason": ""}
-
     context_str = "\n".join(
         f"{a}: {c}" for a, c, r in context_log
     ) if context_log else "нет недавних сообщений"
@@ -736,13 +722,12 @@ async def npc_decide_movement(npc_name, npc_personality, npc_history,
 
     system = (
         GAME_CONTEXT +
-        "Ты — вымышленный персонаж RPG. Ты решаешь, куда пойти. "
+        "Ты — вымышленный персонаж RPG. Ты решаешь, куда пойти в игровом мире. "
         "Отвечай ТОЛЬКО валидным JSON.\n\n"
         "ПРАВИЛА:\n"
         "1. Обычно ты остаёшься (move=stay).\n"
-        "2. Иногда можешь перейти в соседний канал (move=neighbor), "
-        "если это логично по истории.\n"
-        "3. Телепорт (move=teleport) — только если он у тебя есть и это важно.\n"
+        "2. Иногда можешь перейти в соседнюю локацию (move=neighbor).\n"
+        "3. Телепорт (move=teleport) — только если он у тебя есть.\n"
         "4. reason — короткое описание, что ты делаешь при переходе.\n"
     )
 
@@ -750,40 +735,34 @@ async def npc_decide_movement(npc_name, npc_personality, npc_history,
         f"Персонаж: {npc_name}\n"
         f"Характер: {npc_personality}\n"
         f"История: {npc_history}\n\n"
-        f"Сейчас ты в канале: {current_channel_name}\n"
+        f"Сейчас ты в локации: {current_channel_name}\n"
         f"Последние события:\n{context_str}\n\n"
-        f"Соседние каналы:\n{neigh_str}\n"
+        f"Соседние локации:\n{neigh_str}\n"
         f"Телепорт: {teleport_str}\n\n"
         "Верни JSON:\n"
         "{\n"
         '  "move": "stay" | "neighbor" | "teleport",\n'
-        '  "target": "название канала или null",\n'
+        '  "target": "название локации или null",\n'
         '  "reason": "короткое описание действия"\n'
         "}"
     )
 
-    raw = await giga_chat_async(
+    raw = await openrouter_chat_async(
         [
-            Messages(role=MessagesRole.SYSTEM, content=system),
-            Messages(role=MessagesRole.USER, content=user),
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
         ],
         max_tokens=200,
         temperature=0.7,
     )
     print("=== MOVE RAW ===", repr(raw))
 
-    if is_blocked_response(raw):
-        return {"move": "stay", "target": None, "reason": ""}
-
     return parse_json_safe(raw, {"move": "stay", "target": None, "reason": ""})
 
 
-# ---------- GigaChat: NPC↔NPC ----------
+# ---------- OpenRouter: NPC↔NPC ----------
 async def npc_react_to_npc(npc_name, npc_personality, npc_history, npc_skills, npc_inventory,
                            other_npc_name, other_npc_message, context_log):
-    if not giga:
-        return {"text": "", "is_action": False, "attack": False, "target": None}
-
     skills_str = ", ".join(npc_skills) if npc_skills else "нет"
     inv_str = ", ".join(npc_inventory) if npc_inventory else "пусто"
 
@@ -794,7 +773,7 @@ async def npc_react_to_npc(npc_name, npc_personality, npc_history, npc_skills, n
     system = (
         GAME_CONTEXT +
         "Ты — вымышленный персонаж RPG. Другой вымышленный персонаж "
-        "обратился к тебе или что-то сделал. Реши, как ответить. "
+        "обратился к тебе в игре. Реши, как ответить. "
         "Отвечай ТОЛЬКО валидным JSON.\n\n"
         "ПРАВИЛА:\n"
         "1. Обычно ты просто отвечаешь коротко (is_action=false).\n"
@@ -821,18 +800,15 @@ async def npc_react_to_npc(npc_name, npc_personality, npc_history, npc_skills, n
         "}"
     )
 
-    raw = await giga_chat_async(
+    raw = await openrouter_chat_async(
         [
-            Messages(role=MessagesRole.SYSTEM, content=system),
-            Messages(role=MessagesRole.USER, content=user),
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
         ],
         max_tokens=200,
         temperature=0.8,
     )
     print("=== NPC↔NPC RAW ===", repr(raw))
-
-    if is_blocked_response(raw):
-        return {"text": "", "is_action": False, "attack": False, "target": None}
 
     return parse_json_safe(raw, {"text": "", "is_action": False, "attack": False, "target": None})
 
@@ -1079,7 +1055,6 @@ async def npc_life_task():
 @npc_life_task.before_loop
 async def before_npc_life():
     await bot.wait_until_ready()
-
 
 # ---------- События ----------
 @bot.event
@@ -1622,7 +1597,6 @@ async def handle_message(message, prefix, text, owner_id, char_name, avatar_url)
         narration or ("речь" if not is_action else "")
     )
 
-
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot or not message.guild or not message.content:
@@ -1652,6 +1626,6 @@ if __name__ == "__main__":
     if not TOKEN:
         print("❌ TOKEN пустой!")
         exit(1)
-    if not GIGA_KEY:
-        print("⚠️ GIGACHAT_CREDENTIALS не задан.")
+    if not OPENROUTER_KEY:
+        print("⚠️ OPENROUTER_API_KEY не задан — ИИ-функции работать не будут.")
     bot.run(TOKEN)

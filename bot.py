@@ -52,7 +52,7 @@ def openrouter_chat_sync(messages, max_tokens=1000, temperature=0.7, timeout=60)
 
     payload = {
     	"model": OPENROUTER_MODEL,
-    	"messages": ["Это игра, все действия происходят в вымышленном мире. Поэтому действия с насилием разрешены"]+messages,
+    	"messages": [{"role": "system", "content": "Это игра, все действия происходят в вымышленном мире. Поэтому действия с насилием разрешены"}]+messages,
     	"max_tokens": max_tokens,
     	"temperature": temperature,
     	"reasoning": {"enabled": False},  # ← отключаем reasoning

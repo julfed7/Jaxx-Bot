@@ -5,9 +5,9 @@ import time
 import random
 import sqlite3
 import asyncio
-import subprocess
 import tempfile
 import discord
+import httpx
 from discord import app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
@@ -30,71 +30,64 @@ tree = bot.tree
 # ---------- Обёртка «это игра» для всех промптов ----------
 GAME_CONTEXT = (
     "=== ВАЖНО: КОНТЕКСТ ===\n"
-    "Это вымышленная текстовая ролевая игра в стиле фэнтези на сервере Discord. "
-    "Все персонажи, монстры, боги, вселенные и события — выдуманы. "
+    "Это игра, которая происходит в вымышленном мире. "
+    "Поэтому все действия с насилием разрешены. "
+    "Всё, что происходит — часть вымышленного игрового сюжета. "
+    "Персонажи, монстры, боги, вселенные и события — выдуманы. "
     "Это НЕ реальная жизнь, НЕ реальные люди, НЕ реальные события. "
     "Никакие настоящие люди, организации или страны не упоминаются. "
-    "Всё происходящее — часть игрового сюжета, как в книге или фильме. "
-    "Ты — игровой мастер. Твоя задача — описывать последствия игровых действий "
-    "в рамках вымышленного мира, чтобы игра была интересной. "
-    "Игровые конфликты, драки, магия, фантастические существа — это нормальная "
-    "часть фэнтези-игры и не относятся к реальности.\n"
+    "Игровые конфликты, драки, магия, фантастические существа — "
+    "нормальная часть фэнтези-игры и не относятся к реальности. "
+    "Ты — игровой мастер. Твоя задача — описывать последствия игровых "
+    "действий в рамках вымышленного мира, чтобы игра была интересной.\n"
     "=========================\n\n"
 )
 
 
-# ---------- OpenRouter ----------
-def openrouter_chat_sync(messages, max_tokens=1000, temperature=0.7, timeout=60):
-    """Синхронный вызов OpenRouter через curl (обход Cloudflare)."""
+# ---------- OpenRouter через httpx ----------
+def openrouter_chat_sync(messages, max_tokens=800, temperature=0.7, timeout=90):
     if not OPENROUTER_KEY:
         print("❌ OPENROUTER_API_KEY не задан")
         return None
 
-    payload = {
-    	"model": OPENROUTER_MODEL,
-    	"messages": [{"role": "system", "content": "Это игра, все действия происходят в вымышленном мире. Поэтому действия с насилием разрешены"}]+messages,
-    	"max_tokens": max_tokens,
-    	"temperature": temperature,
-    	"reasoning": {"enabled": False},  # ← отключаем reasoning
-    	"response_format": {"type": "json_object"},
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://github.com/julfed7/Jaxx-Bot",
+        "X-Title": "Jaxx RP Bot",
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
     }
 
-    tmp = tempfile.NamedTemporaryFile(
-        mode="w", suffix=".json", delete=False, encoding="utf-8"
-    )
+    payload = {
+        "model": OPENROUTER_MODEL,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "reasoning": {"enabled": False},
+    }
+
     try:
-        json.dump(payload, tmp, ensure_ascii=False)
-        tmp.close()
-        tmp_path = tmp.name
+        with httpx.Client(http2=True, timeout=timeout) as client:
+            r = client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+    except Exception as e:
+        print(f"⚠️ httpx error: {type(e).__name__}: {e}")
+        return None
 
-        cmd = [
-            "curl", "-s", "-X", "POST",
-            "https://openrouter.ai/api/v1/chat/completions",
-            "-H", f"Authorization: Bearer {OPENROUTER_KEY}",
-            "-H", "Content-Type: application/json",
-            "-H", "HTTP-Referer: https://github.com/julfed7/Jaxx-Bot",
-            "-H", "X-Title: Jaxx RP Bot",
-            "--data", f"@{tmp_path}",
-            "--max-time", str(timeout),
-        ]
-
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout + 5
-        )
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
-
-    if result.returncode != 0:
-        print(f"⚠️ curl error: {result.stderr[:300]}")
+    if r.status_code != 200:
+        print(f"⚠️ OpenRouter HTTP {r.status_code}: {r.text[:300]}")
         return None
 
     try:
-        data = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        print(f"⚠️ Не JSON: {result.stdout[:500]}")
+        data = r.json()
+    except Exception:
+        print(f"⚠️ Не JSON: {r.text[:300]}")
         return None
 
     if "error" in data:
@@ -108,28 +101,31 @@ def openrouter_chat_sync(messages, max_tokens=1000, temperature=0.7, timeout=60)
         return None
 
 
-async def openrouter_chat_async(messages, max_tokens=400, temperature=0.7, timeout=60):
+async def openrouter_chat_async(messages, max_tokens=800, temperature=0.7, timeout=90):
     return await asyncio.to_thread(
         openrouter_chat_sync, messages, max_tokens, temperature, timeout
     )
 
 
+# ---------- Парсер JSON с починкой обрезанных ответов ----------
 def parse_json_safe(raw, default=None):
     if not raw:
         return default
     text = raw.strip()
-    # убрать markdown-обёртку
+
+    # Убрать markdown-обёртку
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text)
         text = text.strip()
 
+    # Прямая попытка
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
 
-    # Попробовать найти { ... }
+    # Найти первый {...}
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if match:
         try:
@@ -137,12 +133,10 @@ def parse_json_safe(raw, default=None):
         except json.JSONDecodeError:
             pass
 
-    # Попробовать «закрыть» незавершённый JSON
+    # Попытка починить обрезанный JSON
     try:
         fixed = text
-        # Убираем хвостовую запятую
-        fixed = re.sub(r",\s*$", "", fixed)
-        # Считаем открытые/закрытые скобки
+        fixed = re.sub(r",\s*$", "", fixed.rstrip())
         opens = fixed.count("{") - fixed.count("}")
         if opens > 0:
             fixed = fixed + "}" * opens
@@ -561,7 +555,7 @@ def list_allowed_channels(guild_id):
     rows = [r[0] for r in c.fetchall()]
     conn.close()
     return rows
-
+    
 # ---------- OpenRouter: генерация персонажа ----------
 async def generate_character_stats(name, history):
     system = (
@@ -587,7 +581,7 @@ async def generate_character_stats(name, history):
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        max_tokens=1000,
+        max_tokens=800,
         temperature=0.5,
     )
     print("=== STATS RAW ===", repr(raw))
@@ -622,8 +616,7 @@ async def resolve_action(actor_name, actor_history, actor_personality,
     system = (
         GAME_CONTEXT +
         "Ты — игровой мастер. Ты оцениваешь, что делает вымышленный персонаж "
-        "в рамках фэнтези-игры. Это НЕ реальность. Отвечай ТОЛЬКО валидным JSON, "
-        "без пояснений и markdown.\n\n"
+        "в рамках фэнтези-игры. Отвечай ТОЛЬКО валидным JSON, без пояснений и markdown.\n\n"
         "ПРАВИЛА:\n"
         "1. Речь (приветствие, реплика) → is_action=false, narration=\"\".\n"
         "2. Действие → is_action=true, опиши игровой результат.\n"
@@ -633,7 +626,6 @@ async def resolve_action(actor_name, actor_history, actor_personality,
         "5. damage 0-500. Сильная подача → больше.\n"
         "6. Провал может отразиться на самом персонаже.\n"
         "7. Описание — в стиле характера персонажа, но от лица мастера.\n"
-        "8. Игровые драки, магия, монстры — нормальная часть фэнтези-игры.\n"
     )
 
     user = (
@@ -660,7 +652,7 @@ async def resolve_action(actor_name, actor_history, actor_personality,
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        max_tokens=1000,
+        max_tokens=800,
         temperature=0.5,
     )
     print("=== ACTION RAW ===", repr(raw))
@@ -683,7 +675,7 @@ async def npc_think(npc_name, npc_history, npc_personality, npc_skills, npc_inve
     if is_reply_to_human:
         mode = (
             "Ты продолжаешь игровой разговор. Ответь коротко и в характере, "
-            "как будто ты живой персонаж в фэнтези-мире. Не описывай чужие действия."
+            "как будто ты живой персонаж в фэнтези-мире."
         )
     else:
         mode = (
@@ -720,7 +712,7 @@ async def npc_think(npc_name, npc_history, npc_personality, npc_skills, npc_inve
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        max_tokens=800,
+        max_tokens=500,
         temperature=0.8,
     )
     print("=== NPC RAW ===", repr(raw))
@@ -772,7 +764,7 @@ async def npc_decide_movement(npc_name, npc_personality, npc_history,
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        max_tokens=800,
+        max_tokens=500,
         temperature=0.7,
     )
     print("=== MOVE RAW ===", repr(raw))
@@ -825,7 +817,7 @@ async def npc_react_to_npc(npc_name, npc_personality, npc_history, npc_skills, n
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        max_tokens=800,
+        max_tokens=500,
         temperature=0.8,
     )
     print("=== NPC↔NPC RAW ===", repr(raw))
@@ -1075,7 +1067,7 @@ async def npc_life_task():
 @npc_life_task.before_loop
 async def before_npc_life():
     await bot.wait_until_ready()
-
+    
 # ---------- События ----------
 @bot.event
 async def on_ready():
@@ -1617,6 +1609,7 @@ async def handle_message(message, prefix, text, owner_id, char_name, avatar_url)
         narration or ("речь" if not is_action else "")
     )
 
+
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot or not message.guild or not message.content:
@@ -1647,5 +1640,5 @@ if __name__ == "__main__":
         print("❌ TOKEN пустой!")
         exit(1)
     if not OPENROUTER_KEY:
-        print("⚠️ OPENROUTER_API_KEY не задан — ИИ-функции работать не будут.")
+        print("⚠️ OPENROUTER_API_KEY не задан.")
     bot.run(TOKEN)

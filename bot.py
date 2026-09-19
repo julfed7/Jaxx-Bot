@@ -57,7 +57,6 @@ def openrouter_chat_sync(messages, max_tokens=1000, temperature=0.7, timeout=60)
     	"temperature": temperature,
     	"reasoning": {"enabled": False},  # ← отключаем reasoning
     	"response_format": {"type": "json_object"},
-}
     }
 
     tmp = tempfile.NamedTemporaryFile(

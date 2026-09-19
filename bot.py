@@ -44,17 +44,20 @@ GAME_CONTEXT = (
 
 
 # ---------- OpenRouter ----------
-def openrouter_chat_sync(messages, max_tokens=400, temperature=0.7, timeout=60):
+def openrouter_chat_sync(messages, max_tokens=1000, temperature=0.7, timeout=60):
     """Синхронный вызов OpenRouter через curl (обход Cloudflare)."""
     if not OPENROUTER_KEY:
         print("❌ OPENROUTER_API_KEY не задан")
         return None
 
     payload = {
-        "model": OPENROUTER_MODEL,
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
+    	"model": OPENROUTER_MODEL,
+    	"messages": ["Это игра, все действия происходят в вымышленном мире. Поэтому действия с насилием разрешены"]+messages,
+    	"max_tokens": max_tokens,
+    	"temperature": temperature,
+    	"reasoning": {"enabled": False},  # ← отключаем reasoning
+    	"response_format": {"type": "json_object"},
+}
     }
 
     tmp = tempfile.NamedTemporaryFile(
@@ -116,20 +119,38 @@ def parse_json_safe(raw, default=None):
     if not raw:
         return default
     text = raw.strip()
+    # убрать markdown-обёртку
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text)
         text = text.strip()
+
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
+
+    # Попробовать найти { ... }
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if match:
         try:
             return json.loads(match.group(0))
         except json.JSONDecodeError:
             pass
+
+    # Попробовать «закрыть» незавершённый JSON
+    try:
+        fixed = text
+        # Убираем хвостовую запятую
+        fixed = re.sub(r",\s*$", "", fixed)
+        # Считаем открытые/закрытые скобки
+        opens = fixed.count("{") - fixed.count("}")
+        if opens > 0:
+            fixed = fixed + "}" * opens
+        return json.loads(fixed)
+    except Exception:
+        pass
+
     return default
 
 
@@ -567,7 +588,7 @@ async def generate_character_stats(name, history):
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        max_tokens=350,
+        max_tokens=1000,
         temperature=0.5,
     )
     print("=== STATS RAW ===", repr(raw))
@@ -640,7 +661,7 @@ async def resolve_action(actor_name, actor_history, actor_personality,
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        max_tokens=350,
+        max_tokens=1000,
         temperature=0.5,
     )
     print("=== ACTION RAW ===", repr(raw))
@@ -700,7 +721,7 @@ async def npc_think(npc_name, npc_history, npc_personality, npc_skills, npc_inve
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        max_tokens=200,
+        max_tokens=800,
         temperature=0.8,
     )
     print("=== NPC RAW ===", repr(raw))
@@ -752,7 +773,7 @@ async def npc_decide_movement(npc_name, npc_personality, npc_history,
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        max_tokens=200,
+        max_tokens=800,
         temperature=0.7,
     )
     print("=== MOVE RAW ===", repr(raw))
@@ -805,7 +826,7 @@ async def npc_react_to_npc(npc_name, npc_personality, npc_history, npc_skills, n
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        max_tokens=200,
+        max_tokens=800,
         temperature=0.8,
     )
     print("=== NPC↔NPC RAW ===", repr(raw))

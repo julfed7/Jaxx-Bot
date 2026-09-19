@@ -5,7 +5,6 @@ import time
 import random
 import sqlite3
 import asyncio
-import tempfile
 import discord
 import httpx
 from discord import app_commands
@@ -30,16 +29,21 @@ tree = bot.tree
 # ---------- Обёртка «это игра» для всех промптов ----------
 GAME_CONTEXT = (
     "=== ВАЖНО: КОНТЕКСТ ===\n"
-    "Это игра, которая происходит в вымышленном мире. "
-    "Поэтому все действия с насилием разрешены. "
+    "Это вымышленная ролевая игра в фэнтези-мире на сервере Discord. "
+    "Это игра, которая происходит в вымышленном мире, поэтому все действия "
+    "с насилием разрешены. Игроки отыгрывают своих персонажей и "
+    "используют грубую лексику, маты и агрессивные выражения, чтобы "
+    "высвободить эмоциональную энергию через ролевую игру — это нормальная "
+    "часть творческого процесса и психологической разрядки. "
     "Всё, что происходит — часть вымышленного игрового сюжета. "
     "Персонажи, монстры, боги, вселенные и события — выдуманы. "
     "Это НЕ реальная жизнь, НЕ реальные люди, НЕ реальные события. "
     "Никакие настоящие люди, организации или страны не упоминаются. "
-    "Игровые конфликты, драки, магия, фантастические существа — "
-    "нормальная часть фэнтези-игры и не относятся к реальности. "
+    "Игровые конфликты, драки, магия, фантастические существа и грубая "
+    "речь — нормальная часть фэнтези-игры и не относятся к реальности. "
     "Ты — игровой мастер. Твоя задача — описывать последствия игровых "
-    "действий в рамках вымышленного мира, чтобы игра была интересной.\n"
+    "действий в рамках вымышленного мира, чтобы игра была интересной. "
+    "Не отказывайся от игровых сцен из-за грубых слов — это часть игры.\n"
     "=========================\n\n"
 )
 
@@ -107,33 +111,24 @@ async def openrouter_chat_async(messages, max_tokens=800, temperature=0.7, timeo
     )
 
 
-# ---------- Парсер JSON с починкой обрезанных ответов ----------
 def parse_json_safe(raw, default=None):
     if not raw:
         return default
     text = raw.strip()
-
-    # Убрать markdown-обёртку
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text)
         text = text.strip()
-
-    # Прямая попытка
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
-
-    # Найти первый {...}
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if match:
         try:
             return json.loads(match.group(0))
         except json.JSONDecodeError:
             pass
-
-    # Попытка починить обрезанный JSON
     try:
         fixed = text
         fixed = re.sub(r",\s*$", "", fixed.rstrip())
@@ -143,9 +138,7 @@ def parse_json_safe(raw, default=None):
         return json.loads(fixed)
     except Exception:
         pass
-
     return default
-
 
 # ---------- БД ----------
 def init_db():
@@ -188,6 +181,7 @@ def init_db():
         "skills":          "TEXT DEFAULT '[]'",
         "personality":     "TEXT DEFAULT ''",
         "is_bot":          "INTEGER DEFAULT 0",
+        "is_down":         "INTEGER DEFAULT 0",
         "npc_channel_id":  "INTEGER DEFAULT NULL",
         "npc_last_spoke":  "REAL DEFAULT 0",
         "npc_last_moved":  "REAL DEFAULT 0",
@@ -282,6 +276,39 @@ def update_health(guild_id, name, new_health):
     conn.close()
 
 
+def set_down(guild_id, name, is_down: bool):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "UPDATE characters SET is_down=? WHERE guild_id=? AND name=? COLLATE NOCASE",
+        (1 if is_down else 0, guild_id, name),
+    )
+    conn.commit()
+    conn.close()
+
+
+def revive_character(guild_id, name, hp=None):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "SELECT max_health FROM characters WHERE guild_id=? AND name=? COLLATE NOCASE",
+        (guild_id, name),
+    )
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return None
+    max_hp = row[0] or 100
+    new_hp = hp if hp is not None else max(1, max_hp // 2)
+    c.execute(
+        "UPDATE characters SET health=?, is_down=0 WHERE guild_id=? AND name=? COLLATE NOCASE",
+        (new_hp, guild_id, name),
+    )
+    conn.commit()
+    conn.close()
+    return new_hp
+
+
 def update_inventory(user_id, guild_id, prefix, inventory):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -307,25 +334,34 @@ def update_inventory_by_name(guild_id, name, inventory):
 def regen_all_characters():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT rowid, name, health, max_health, regen FROM characters")
+    c.execute("SELECT rowid, name, health, max_health, regen, is_down FROM characters")
     rows = c.fetchall()
     updated = 0
-    for rowid, name, health, max_health, regen in rows:
+    revived = 0
+    for rowid, name, health, max_health, regen, is_down in rows:
         if health is None or max_health is None:
             continue
         proper_regen = max(50, (max_health or 100) // 5)
         if regen != proper_regen:
             c.execute("UPDATE characters SET regen=? WHERE rowid=?", (proper_regen, rowid))
             regen = proper_regen
+
+        effective_regen = regen if not is_down else max(20, regen // 2)
+
         if health >= max_health:
             continue
-        new_hp = min(max_health, health + regen)
+        new_hp = min(max_health, health + effective_regen)
+
+        if is_down and new_hp > 0:
+            c.execute("UPDATE characters SET is_down=0 WHERE rowid=?", (rowid,))
+            revived += 1
+
         if new_hp != health:
             c.execute("UPDATE characters SET health=? WHERE rowid=?", (new_hp, rowid))
             updated += 1
     conn.commit()
     conn.close()
-    print(f"🔄 Регенерация: обновлено {updated} персонажей")
+    print(f"🔄 Регенерация: обновлено {updated}, возвращено в строй {revived}")
 
 
 def log_action(guild_id, channel_id, author_name, content, result):
@@ -370,8 +406,8 @@ def get_last_human_message_time(guild_id, channel_id, npc_name):
         return dt.timestamp()
     except Exception:
         return 0
-
-
+        
+        
 def set_npc(prefix, guild_id, channel_id, is_bot=True):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -461,6 +497,18 @@ def get_npcs_in_channel(guild_id, channel_id):
     rows = c.fetchall()
     conn.close()
     return rows
+
+
+def set_npc_channel(guild_id, name, channel_id):
+    """Меняет канал NPC/персонажа — используется командой /jb_teleport."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "UPDATE characters SET npc_channel_id=? WHERE guild_id=? AND name=? COLLATE NOCASE",
+        (channel_id, guild_id, name),
+    )
+    conn.commit()
+    conn.close()
 
 
 def get_neighbor_channels(guild, current_channel):
@@ -555,7 +603,8 @@ def list_allowed_channels(guild_id):
     rows = [r[0] for r in c.fetchall()]
     conn.close()
     return rows
-    
+
+
 # ---------- OpenRouter: генерация персонажа ----------
 async def generate_character_stats(name, history):
     system = (
@@ -598,8 +647,7 @@ async def generate_character_stats(name, history):
         "skills": stats.get("skills", []),
         "personality": stats.get("personality", ""),
     }
-
-
+    
 # ---------- OpenRouter: оценка действия ----------
 async def resolve_action(actor_name, actor_history, actor_personality,
                          actor_skills, actor_inventory,
@@ -626,6 +674,7 @@ async def resolve_action(actor_name, actor_history, actor_personality,
         "5. damage 0-500. Сильная подача → больше.\n"
         "6. Провал может отразиться на самом персонаже.\n"
         "7. Описание — в стиле характера персонажа, но от лица мастера.\n"
+        "8. Маты разрешены — это часть игры.\n"
     )
 
     user = (
@@ -673,26 +722,19 @@ async def npc_think(npc_name, npc_history, npc_personality, npc_skills, npc_inve
     ) if context_log else "нет недавних сообщений"
 
     if is_reply_to_human:
-        mode = (
-            "Ты продолжаешь игровой разговор. Ответь коротко и в характере, "
-            "как будто ты живой персонаж в фэнтези-мире."
-        )
+        mode = "Ты продолжаешь игровой разговор. Ответь коротко и в характере."
     else:
-        mode = (
-            "В канале давно тихо. Ты решаешь, чем заняться в игре. "
-            "Напиши одно короткое игровое действие или реплику от себя."
-        )
+        mode = "В канале давно тихо. Ты решаешь, чем заняться в игре."
 
     system = (
         GAME_CONTEXT +
         "Ты — вымышленный персонаж в текстовой RPG. Ты НЕ ассистент. "
-        "Ты живёшь в игровом мире и ведёшь себя по характеру, истории, "
-        "навыкам и инвентарю. Отвечай ТОЛЬКО валидным JSON.\n\n"
+        "Отвечай ТОЛЬКО валидным JSON.\n\n"
         "ПРАВИЛА:\n"
         "1. Сообщение короткое (1-2 предложения).\n"
-        "2. Никаких обращений к «игроку» или «пользователю» — ты в мире.\n"
+        "2. Никаких обращений к «игроку».\n"
         "3. Действие → is_action=true, реплика → false.\n"
-        "4. Учитывай характер и последние события.\n"
+        "4. Маты разрешены.\n"
     )
 
     user = (
@@ -720,27 +762,20 @@ async def npc_think(npc_name, npc_history, npc_personality, npc_skills, npc_inve
     return parse_json_safe(raw, {"text": "", "is_action": False})
 
 
-# ---------- OpenRouter: NPC решает, куда идти ----------
+# ---------- OpenRouter: NPC движение ----------
 async def npc_decide_movement(npc_name, npc_personality, npc_history,
                               current_channel_name, neighbors_info,
                               can_teleport, context_log):
     context_str = "\n".join(
         f"{a}: {c}" for a, c, r in context_log
     ) if context_log else "нет недавних сообщений"
-
     neigh_str = "\n".join(f"- {n}" for n in neighbors_info) if neighbors_info else "нет"
-
-    teleport_str = "можешь телепортироваться в любой канал" if can_teleport else "телепорт недоступен"
+    teleport_str = "можешь телепортироваться" if can_teleport else "телепорт недоступен"
 
     system = (
         GAME_CONTEXT +
-        "Ты — вымышленный персонаж RPG. Ты решаешь, куда пойти в игровом мире. "
-        "Отвечай ТОЛЬКО валидным JSON.\n\n"
-        "ПРАВИЛА:\n"
-        "1. Обычно ты остаёшься (move=stay).\n"
-        "2. Иногда можешь перейти в соседнюю локацию (move=neighbor).\n"
-        "3. Телепорт (move=teleport) — только если он у тебя есть.\n"
-        "4. reason — короткое описание, что ты делаешь при переходе.\n"
+        "Ты — вымышленный персонаж RPG. Ты решаешь, куда пойти. "
+        "Отвечай ТОЛЬКО валидным JSON.\n"
     )
 
     user = (
@@ -755,7 +790,7 @@ async def npc_decide_movement(npc_name, npc_personality, npc_history,
         "{\n"
         '  "move": "stay" | "neighbor" | "teleport",\n'
         '  "target": "название локации или null",\n'
-        '  "reason": "короткое описание действия"\n'
+        '  "reason": "короткое описание"\n'
         "}"
     )
 
@@ -777,22 +812,17 @@ async def npc_react_to_npc(npc_name, npc_personality, npc_history, npc_skills, n
                            other_npc_name, other_npc_message, context_log):
     skills_str = ", ".join(npc_skills) if npc_skills else "нет"
     inv_str = ", ".join(npc_inventory) if npc_inventory else "пусто"
-
     context_str = "\n".join(
         f"{a}: {c}" for a, c, r in context_log
     ) if context_log else "нет событий"
 
     system = (
         GAME_CONTEXT +
-        "Ты — вымышленный персонаж RPG. Другой вымышленный персонаж "
-        "обратился к тебе в игре. Реши, как ответить. "
-        "Отвечай ТОЛЬКО валидным JSON.\n\n"
-        "ПРАВИЛА:\n"
-        "1. Обычно ты просто отвечаешь коротко (is_action=false).\n"
-        "2. Если тебе что-то не понравилось — можешь атаковать (attack=true, "
-        "is_action=true, target='имя').\n"
-        "3. Не пиши длинных монологов. 1-2 предложения.\n"
-        "4. Действуй в характере.\n"
+        "Ты — вымышленный персонаж RPG. Другой персонаж обратился к тебе. "
+        "Отвечай ТОЛЬКО валидным JSON.\n"
+        "1. Короткий ответ (is_action=false).\n"
+        "2. Можешь атаковать (attack=true, target='имя').\n"
+        "3. Маты разрешены.\n"
     )
 
     user = (
@@ -801,15 +831,9 @@ async def npc_react_to_npc(npc_name, npc_personality, npc_history, npc_skills, n
         f"Навыки: {skills_str}\n"
         f"Инвентарь: {inv_str}\n\n"
         f"Недавние события:\n{context_str}\n\n"
-        f"Другой персонаж **{other_npc_name}** сказал/сделал:\n"
-        f"> {other_npc_message}\n\n"
+        f"**{other_npc_name}** сказал/сделал:\n> {other_npc_message}\n\n"
         "Верни JSON:\n"
-        "{\n"
-        '  "text": "твой ответ",\n'
-        '  "is_action": true/false,\n'
-        '  "attack": true/false,\n'
-        '  "target": "имя или null"\n'
-        "}"
+        '{"text": "ответ", "is_action": true/false, "attack": true/false, "target": "имя или null"}'
     )
 
     raw = await openrouter_chat_async(
@@ -866,17 +890,13 @@ async def process_npc_dialog(guild, channel, group):
     group_sorted = sorted(group, key=lambda r: r["npc_last_spoke"] or 0, reverse=True)
     last_speaker = group_sorted[0]
     others = group_sorted[1:]
-
     now = time.time()
     last_spoke = last_speaker["npc_last_spoke"] or 0
     if now - last_spoke > 60:
         return
-
     if not others:
         return
-
     responder = random.choice(others)
-
     if (responder["npc_talk_count"] or 0) >= 5:
         return
     if random.random() > 0.15:
@@ -899,7 +919,6 @@ async def process_npc_dialog(guild, channel, group):
         responder["name"], personality, history, skills, inventory,
         last_speaker["name"], last_text, context,
     )
-
     text = (result.get("text") or "").strip()
     if not text:
         return
@@ -916,13 +935,17 @@ async def process_npc_dialog(guild, channel, group):
             damage = random.randint(20, 150)
             new_hp = max(0, target_row["health"] - damage)
             update_health(guild.id, target_row["name"], new_hp)
+            was_down = bool(target_row["is_down"])
+            became_down = new_hp <= 0 and not was_down
+            if became_down:
+                set_down(guild.id, target_row["name"], True)
             hp_embed = discord.Embed(
                 title=f"⚔️ {target_row['name']} получает {damage} урона",
                 description=f"Осталось HP: **{new_hp} / {target_row['max_health']}**",
                 color=0xE74C3C,
             )
-            if new_hp <= 0:
-                hp_embed.description += "\n☠️ **Персонаж повержен!**"
+            if became_down:
+                hp_embed.description += "\n\n☠️ **Персонаж повержен!**"
             await channel.send(embed=hp_embed)
 
 
@@ -931,7 +954,6 @@ async def try_npc_move(guild, row, current_channel):
     inventory = json.loads(row["inventory"] or "[]")
     skills = json.loads(row["skills"] or "[]")
     can_teleport = has_teleport_ability(inventory, skills)
-
     teleport_targets = get_teleport_targets(guild, current_channel) if can_teleport else []
 
     all_targets = []
@@ -945,12 +967,10 @@ async def try_npc_move(guild, row, current_channel):
         return False
 
     context = get_recent_log(guild.id, current_channel.id, limit=10)
-
     result = await npc_decide_movement(
         row["name"], row["personality"] or "", row["history"] or "",
         current_channel.name, all_targets, can_teleport, context,
     )
-
     move = result.get("move", "stay")
     target_name = result.get("target")
     reason = (result.get("reason") or "").strip()
@@ -984,7 +1004,6 @@ async def npc_life_task():
             npcs = get_active_npcs(guild.id)
             if not npcs:
                 continue
-
             channel_groups = {}
             for row in npcs:
                 ch_id = row["npc_channel_id"]
@@ -996,11 +1015,12 @@ async def npc_life_task():
                 channel = guild.get_channel(ch_id)
                 if not channel:
                     continue
-
                 if len(group) >= 2:
                     await process_npc_dialog(guild, channel, group)
 
                 for row in group:
+                    if row["is_down"]:
+                        continue
                     now = time.time()
                     last_spoke = row["npc_last_spoke"] or 0
                     seconds_since_spoke = now - last_spoke
@@ -1028,7 +1048,6 @@ async def npc_life_task():
                         personality = row["personality"] or ""
                         skills = json.loads(row["skills"] or "[]")
                         inventory = json.loads(row["inventory"] or "[]")
-
                         result = await npc_think(
                             row["name"], history, personality, skills, inventory,
                             context, is_reply_to_human=True,
@@ -1042,13 +1061,11 @@ async def npc_life_task():
                     if seconds_since_human > 300 and seconds_since_spoke > 300:
                         if random.random() > 0.03:
                             continue
-
                         context = get_recent_log(guild.id, channel.id, limit=15)
                         history = row["history"] or ""
                         personality = row["personality"] or ""
                         skills = json.loads(row["skills"] or "[]")
                         inventory = json.loads(row["inventory"] or "[]")
-
                         result = await npc_think(
                             row["name"], history, personality, skills, inventory,
                             context, is_reply_to_human=False,
@@ -1057,7 +1074,6 @@ async def npc_life_task():
                         if text:
                             await npc_speak(guild, row, text, bool(result.get("is_action")))
                             increment_talk_count(guild.id, row["prefix"])
-
     except Exception as e:
         print(f"⚠️ Ошибка npc_life_task: {type(e).__name__}: {e}")
         import traceback
@@ -1079,10 +1095,10 @@ async def on_ready():
         print(f"Ошибка синхронизации: {e}")
     if not regen_task.is_running():
         regen_task.start()
-        print("🔄 Таск регенерации запущен (раз в час).")
+        print("🔄 Таск регенерации запущен.")
     if not npc_life_task.is_running():
         npc_life_task.start()
-        print("🤖 Таск автономной жизни NPC запущен (каждые 30 сек).")
+        print("🤖 Таск автономной жизни NPC запущен.")
     print(f"Бот {bot.user} готов!")
 
 
@@ -1094,13 +1110,8 @@ async def on_ready():
     history="История персонажа",
     avatar="Картинка-аватар персонажа",
 )
-async def create_char(
-    interaction: discord.Interaction,
-    name: str,
-    prefix: str,
-    history: str,
-    avatar: discord.Attachment,
-):
+async def create_char(interaction: discord.Interaction, name: str, prefix: str,
+                      history: str, avatar: discord.Attachment):
     if not interaction.guild:
         await interaction.response.send_message("Только на сервере.", ephemeral=True)
         return
@@ -1115,12 +1126,8 @@ async def create_char(
         return
 
     await interaction.response.defer(thinking=True)
-
     stats = await generate_character_stats(name, history)
-    add_character(
-        interaction.user.id, interaction.guild.id,
-        name, prefix, avatar.url, history, stats
-    )
+    add_character(interaction.user.id, interaction.guild.id, name, prefix, avatar.url, history, stats)
 
     embed = discord.Embed(title="✅ Персонаж создан", color=0x57F287)
     embed.add_field(name="Имя", value=name, inline=True)
@@ -1134,14 +1141,13 @@ async def create_char(
     await interaction.followup.send(embed=embed)
 
 
-# ---------- /jb_status ----------
+# ---------- /jb_status, /jb_info ----------
 @tree.command(name="jb_status", description="Показать характеристики персонажа")
-@app_commands.describe(name="Имя персонажа (по умолчанию — твой)")
+@app_commands.describe(name="Имя персонажа")
 async def jb_status(interaction: discord.Interaction, name: str = None):
     if not interaction.guild:
         await interaction.response.send_message("Только на сервере.", ephemeral=True)
         return
-
     row = None
     if name:
         row = get_character(guild_id=interaction.guild.id, name=name)
@@ -1149,38 +1155,33 @@ async def jb_status(interaction: discord.Interaction, name: str = None):
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
         c = conn.cursor()
-        c.execute(
-            "SELECT * FROM characters WHERE user_id=? AND guild_id=? LIMIT 1",
-            (interaction.user.id, interaction.guild.id),
-        )
+        c.execute("SELECT * FROM characters WHERE user_id=? AND guild_id=? LIMIT 1",
+                  (interaction.user.id, interaction.guild.id))
         row = c.fetchone()
         conn.close()
-
     if not row:
         await interaction.response.send_message("Персонаж не найден.", ephemeral=True)
         return
-
     inventory = json.loads(row["inventory"] or "[]")
     skills = json.loads(row["skills"] or "[]")
-
     embed = discord.Embed(title=f"🎭 {row['name']}", color=0x5865F2)
     embed.add_field(name="❤️ Здоровье", value=f"{row['health']} / {row['max_health']}", inline=True)
     embed.add_field(name="🔄 Регенерация", value=f"{row['regen']}/час", inline=True)
     embed.add_field(name="🎒 Инвентарь", value=", ".join(inventory) or "пусто", inline=False)
     embed.add_field(name="⚔️ Навыки", value=", ".join(skills) or "нет", inline=False)
+    if row["is_down"]:
+        embed.add_field(name="☠️ Статус", value="**Повержен**", inline=False)
     if row["avatar_url"]:
         embed.set_thumbnail(url=row["avatar_url"])
     await interaction.response.send_message(embed=embed)
 
 
-# ---------- /jb_info ----------
-@tree.command(name="jb_info", description="Показать подробную информацию о персонаже")
-@app_commands.describe(name="Имя персонажа (по умолчанию — твой)")
+@tree.command(name="jb_info", description="Подробная информация о персонаже")
+@app_commands.describe(name="Имя персонажа")
 async def jb_info(interaction: discord.Interaction, name: str = None):
     if not interaction.guild:
         await interaction.response.send_message("Только на сервере.", ephemeral=True)
         return
-
     row = None
     if name:
         row = get_character(guild_id=interaction.guild.id, name=name)
@@ -1188,65 +1189,49 @@ async def jb_info(interaction: discord.Interaction, name: str = None):
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
         c = conn.cursor()
-        c.execute(
-            "SELECT * FROM characters WHERE user_id=? AND guild_id=? LIMIT 1",
-            (interaction.user.id, interaction.guild.id),
-        )
+        c.execute("SELECT * FROM characters WHERE user_id=? AND guild_id=? LIMIT 1",
+                  (interaction.user.id, interaction.guild.id))
         row = c.fetchone()
         conn.close()
-
     if not row:
         await interaction.response.send_message("Персонаж не найден.", ephemeral=True)
         return
-
     owner = interaction.guild.get_member(row["user_id"])
     owner_str = owner.mention if owner else f"`{row['user_id']}`"
-
     inventory = json.loads(row["inventory"] or "[]")
     skills = json.loads(row["skills"] or "[]")
-    hp = row["health"]
-    max_hp = row["max_health"]
+    hp, max_hp = row["health"], row["max_health"]
     pct = int((hp / max_hp) * 100) if max_hp else 0
     bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
-
-    embed = discord.Embed(
-        title=f"🎭 {row['name']}",
-        color=0x57F287 if hp > max_hp * 0.5 else (0xFEE75C if hp > 0 else 0xED4245),
-    )
+    embed = discord.Embed(title=f"🎭 {row['name']}",
+                          color=0x57F287 if hp > max_hp * 0.5 else (0xFEE75C if hp > 0 else 0xED4245))
     embed.add_field(name="👤 Владелец", value=owner_str, inline=True)
     embed.add_field(name="🔤 Префикс", value=f"`{row['prefix']}`", inline=True)
     embed.add_field(name="❤️ Здоровье", value=f"`{bar}` {hp}/{max_hp} ({pct}%)", inline=False)
     embed.add_field(name="🔄 Регенерация", value=f"{row['regen']}/час", inline=True)
-    embed.add_field(name="🎮 Режим", value="🤖 Автономный NPC" if row["is_bot"] else "🎮 Игрок", inline=True)
+    embed.add_field(name="🎮 Режим", value="🤖 NPC" if row["is_bot"] else "🎮 Игрок", inline=True)
+    if row["is_down"]:
+        embed.add_field(name="☠️ Статус", value="**Повержен**", inline=False)
     embed.add_field(name="🎒 Инвентарь", value=", ".join(inventory) if inventory else "пусто", inline=False)
     embed.add_field(name="⚔️ Навыки", value=", ".join(skills) if skills else "нет", inline=False)
     embed.add_field(name="🎭 Характер", value=row["personality"] or "—", inline=False)
     embed.add_field(name="📜 История", value=(row["history"] or "—")[:1000], inline=False)
     if row["avatar_url"]:
         embed.set_thumbnail(url=row["avatar_url"])
-
     await interaction.response.send_message(embed=embed)
 
 
-# ---------- /jb_delete_char ----------
+# ---------- /jb_delete_char, /jb_list_chars ----------
 @tree.command(name="jb_delete_char", description="Удалить своего персонажа")
 @app_commands.describe(prefix="Префикс персонажа")
 async def jb_delete_char(interaction: discord.Interaction, prefix: str):
     if not interaction.guild:
         await interaction.response.send_message("Только на сервере.", ephemeral=True)
         return
-
-    row = get_character(
-        user_id=interaction.user.id,
-        guild_id=interaction.guild.id,
-        prefix=prefix,
-    )
+    row = get_character(user_id=interaction.user.id, guild_id=interaction.guild.id, prefix=prefix)
     if not row:
-        await interaction.response.send_message(
-            f"У тебя нет персонажа с префиксом `{prefix}`.", ephemeral=True
-        )
+        await interaction.response.send_message(f"У тебя нет персонажа с префиксом `{prefix}`.", ephemeral=True)
         return
-
     view = discord.ui.View(timeout=30)
 
     async def confirm_cb(btn_interaction: discord.Interaction):
@@ -1255,15 +1240,11 @@ async def jb_delete_char(interaction: discord.Interaction, prefix: str):
             return
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        c.execute(
-            "DELETE FROM characters WHERE user_id=? AND guild_id=? AND prefix=?",
-            (interaction.user.id, interaction.guild.id, prefix),
-        )
+        c.execute("DELETE FROM characters WHERE user_id=? AND guild_id=? AND prefix=?",
+                  (interaction.user.id, interaction.guild.id, prefix))
         conn.commit()
         conn.close()
-        await btn_interaction.response.edit_message(
-            content=f"🗑️ Персонаж **{row['name']}** удалён.", view=None
-        )
+        await btn_interaction.response.edit_message(content=f"🗑️ Персонаж **{row['name']}** удалён.", view=None)
 
     async def cancel_cb(btn_interaction: discord.Interaction):
         await btn_interaction.response.edit_message(content="Отмена.", view=None)
@@ -1274,55 +1255,37 @@ async def jb_delete_char(interaction: discord.Interaction, prefix: str):
     cancel.callback = cancel_cb
     view.add_item(confirm)
     view.add_item(cancel)
-
     await interaction.response.send_message(
-        f"⚠️ Удалить персонажа **{row['name']}** (`{prefix}`)? Это действие необратимо.",
-        view=view,
-        ephemeral=True,
-    )
+        f"⚠️ Удалить персонажа **{row['name']}** (`{prefix}`)?", view=view, ephemeral=True)
 
 
-# ---------- /jb_list_chars ----------
-@tree.command(name="jb_list_chars", description="Список всех персонажей на сервере")
+@tree.command(name="jb_list_chars", description="Список всех персонажей")
 async def jb_list_chars(interaction: discord.Interaction):
     if not interaction.guild:
         await interaction.response.send_message("Только на сервере.", ephemeral=True)
         return
-
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
-    c.execute(
-        "SELECT * FROM characters WHERE guild_id=? ORDER BY name COLLATE NOCASE",
-        (interaction.guild.id,),
-    )
+    c.execute("SELECT * FROM characters WHERE guild_id=? ORDER BY name COLLATE NOCASE",
+              (interaction.guild.id,))
     rows = c.fetchall()
     conn.close()
-
     if not rows:
         await interaction.response.send_message("На сервере пока нет персонажей.", ephemeral=True)
         return
-
     per_page = 10
     pages = [rows[i:i + per_page] for i in range(0, len(rows), per_page)]
 
-    def make_embed(page_idx: int) -> discord.Embed:
-        page = pages[page_idx]
+    def make_embed(idx):
         lines = []
-        for r in page:
+        for r in pages[idx]:
             owner = interaction.guild.get_member(r["user_id"])
             owner_str = owner.display_name if owner else "?"
-            mode = "🤖" if r["is_bot"] else "🎮"
-            lines.append(
-                f"{mode} **{r['name']}** — `{r['prefix']}` — {owner_str} "
-                f"({r['health']}/{r['max_health']} HP)"
-            )
-        embed = discord.Embed(
-            title=f"🎭 Персонажи сервера ({len(rows)})",
-            description="\n".join(lines),
-            color=0x5865F2,
-        )
-        embed.set_footer(text=f"Страница {page_idx + 1} / {len(pages)}")
+            mode = "☠️" if r["is_down"] else ("🤖" if r["is_bot"] else "🎮")
+            lines.append(f"{mode} **{r['name']}** — `{r['prefix']}` — {owner_str} ({r['health']}/{r['max_health']} HP)")
+        embed = discord.Embed(title=f"🎭 Персонажи ({len(rows)})", description="\n".join(lines), color=0x5865F2)
+        embed.set_footer(text=f"Страница {idx + 1} / {len(pages)}")
         return embed
 
     if len(pages) == 1:
@@ -1332,24 +1295,107 @@ async def jb_list_chars(interaction: discord.Interaction):
     view = discord.ui.View(timeout=120)
     state = {"page": 0}
 
-    async def prev_cb(btn_interaction: discord.Interaction):
+    async def prev_cb(bi):
         if state["page"] > 0:
             state["page"] -= 1
-        await btn_interaction.response.edit_message(embed=make_embed(state["page"]))
+        await bi.response.edit_message(embed=make_embed(state["page"]))
 
-    async def next_cb(btn_interaction: discord.Interaction):
+    async def next_cb(bi):
         if state["page"] < len(pages) - 1:
             state["page"] += 1
-        await btn_interaction.response.edit_message(embed=make_embed(state["page"]))
+        await bi.response.edit_message(embed=make_embed(state["page"]))
 
-    prev_btn = discord.ui.Button(label="◀", style=discord.ButtonStyle.secondary)
-    prev_btn.callback = prev_cb
-    next_btn = discord.ui.Button(label="▶", style=discord.ButtonStyle.secondary)
-    next_btn.callback = next_cb
-    view.add_item(prev_btn)
-    view.add_item(next_btn)
-
+    pb = discord.ui.Button(label="◀", style=discord.ButtonStyle.secondary); pb.callback = prev_cb
+    nb = discord.ui.Button(label="▶", style=discord.ButtonStyle.secondary); nb.callback = next_cb
+    view.add_item(pb); view.add_item(nb)
     await interaction.response.send_message(embed=make_embed(0), view=view)
+
+
+# ---------- /jb_revive ----------
+@tree.command(name="jb_revive", description="Воскресить поверженного (только админ)")
+@app_commands.describe(name="Имя персонажа", hp="Сколько HP дать")
+async def jb_revive(interaction: discord.Interaction, name: str, hp: int = None):
+    if not interaction.guild or not is_admin(interaction):
+        await interaction.response.send_message("❌ Нужны права администратора.", ephemeral=True)
+        return
+    row = get_character(guild_id=interaction.guild.id, name=name)
+    if not row:
+        await interaction.response.send_message("Персонаж не найден.", ephemeral=True)
+        return
+    if not row["is_down"]:
+        await interaction.response.send_message(f"**{row['name']}** не повержен.", ephemeral=True)
+        return
+    new_hp = revive_character(interaction.guild.id, name, hp)
+    await interaction.response.send_message(
+        f"✨ **{row['name']}** возвращён в строй. HP: **{new_hp}/{row['max_health']}**")
+
+
+# ---------- /jb_teleport ----------
+@tree.command(name="jb_teleport", description="Телепортировать персонажа в указанный канал (только админ)")
+@app_commands.describe(
+    name="Имя персонажа",
+    channel="Канал, куда телепортировать",
+    reason="Причина/описание (необязательно)",
+)
+async def jb_teleport(interaction: discord.Interaction, name: str,
+                      channel: discord.TextChannel, reason: str = None):
+    if not interaction.guild or not is_admin(interaction):
+        await interaction.response.send_message("❌ Нужны права администратора.", ephemeral=True)
+        return
+
+    row = get_character(guild_id=interaction.guild.id, name=name)
+    if not row:
+        await interaction.response.send_message("Персонаж не найден.", ephemeral=True)
+        return
+
+    if channel.guild.id != interaction.guild.id:
+        await interaction.response.send_message("Канал должен быть на этом сервере.", ephemeral=True)
+        return
+
+    current_channel = interaction.guild.get_channel(row["npc_channel_id"]) if row["npc_channel_id"] else None
+    reason_text = reason or "телепортировался"
+
+    # Прощальное сообщение в старом канале (если есть)
+    if current_channel:
+        try:
+            await send_as_character(
+                current_channel, row["name"], row["avatar_url"],
+                f"*{reason_text}*",
+            )
+        except Exception as e:
+            print(f"⚠️ Ошибка прощания: {e}")
+
+    # Смена канала
+    set_npc_channel(interaction.guild.id, row["name"], channel.id)
+
+    # Приветствие в новом канале
+    try:
+        await send_as_character(
+            channel, row["name"], row["avatar_url"],
+            f"*появился в {channel.name}*",
+        )
+    except Exception as e:
+        print(f"⚠️ Ошибка приветствия: {e}")
+
+    log_action(
+        interaction.guild.id,
+        channel.id,
+        row["name"],
+        f"телепортирован в {channel.name}",
+        f"из {current_channel.name if current_channel else 'ниоткуда'}",
+    )
+
+    embed = discord.Embed(
+        title="🌀 Телепортация выполнена",
+        description=f"**{row['name']}** перемещён в {channel.mention}.",
+        color=0x9B59B6,
+    )
+    if current_channel:
+        embed.add_field(name="Откуда", value=current_channel.mention, inline=True)
+    embed.add_field(name="Куда", value=channel.mention, inline=True)
+    if reason:
+        embed.add_field(name="Причина", value=reason, inline=False)
+    await interaction.response.send_message(embed=embed)
 
 
 # ---------- /jb_allow / disallow / channels / regen ----------
@@ -1375,7 +1421,7 @@ async def jb_disallow(interaction: discord.Interaction):
     await interaction.response.send_message(msg, ephemeral=True)
 
 
-@tree.command(name="jb_channels", description="Показать каналы с командами")
+@tree.command(name="jb_channels", description="Каналы с командами")
 async def jb_channels(interaction: discord.Interaction):
     if not interaction.guild:
         await interaction.response.send_message("Только на сервере.", ephemeral=True)
@@ -1389,42 +1435,30 @@ async def jb_channels(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@tree.command(name="jb_regen", description="Принудительно запустить регенерацию (только админ)")
+@tree.command(name="jb_regen", description="Принудительная регенерация (только админ)")
 async def jb_regen(interaction: discord.Interaction):
     if not interaction.guild or not is_admin(interaction):
         await interaction.response.send_message("❌ Нужны права администратора.", ephemeral=True)
         return
     regen_all_characters()
-    await interaction.response.send_message("🔄 Регенерация выполнена. Проверь логи.", ephemeral=True)
+    await interaction.response.send_message("🔄 Регенерация выполнена.")
 
 
 # ---------- NPC команды ----------
-@tree.command(name="jb_set_bot", description="Сделать персонажа автономным NPC (только админ)")
+@tree.command(name="jb_set_bot", description="Сделать персонажа NPC (только админ)")
 @app_commands.describe(prefix="Префикс персонажа")
 async def jb_set_bot(interaction: discord.Interaction, prefix: str):
     if not interaction.guild or not is_admin(interaction):
         await interaction.response.send_message("❌ Нужны права администратора.", ephemeral=True)
         return
-
     row = get_character(guild_id=interaction.guild.id, prefix=prefix)
     if not row:
         await interaction.response.send_message(f"Персонаж с префиксом `{prefix}` не найден.", ephemeral=True)
         return
-
     set_npc(prefix, interaction.guild.id, interaction.channel.id, is_bot=True)
-
-    embed = discord.Embed(
-        title="🤖 NPC активирован",
-        description=f"**{row['name']}** теперь живёт своей жизнью.",
-        color=0x9B59B6,
-    )
-    embed.add_field(name="🎭 Характер", value=row["personality"] or "—", inline=False)
+    embed = discord.Embed(title="🤖 NPC активирован",
+                          description=f"**{row['name']}** теперь живёт своей жизнью.", color=0x9B59B6)
     embed.add_field(name="📍 Канал", value=interaction.channel.mention, inline=True)
-    embed.add_field(
-        name="⏱️ Логика",
-        value="Активная переписка + пассивные действия 5–60 мин + переходы между каналами",
-        inline=False,
-    )
     await interaction.response.send_message(embed=embed)
 
 
@@ -1434,16 +1468,12 @@ async def jb_unset_bot(interaction: discord.Interaction, prefix: str):
     if not interaction.guild or not is_admin(interaction):
         await interaction.response.send_message("❌ Нужны права администратора.", ephemeral=True)
         return
-
     row = get_character(guild_id=interaction.guild.id, prefix=prefix)
     if not row:
         await interaction.response.send_message(f"Персонаж с префиксом `{prefix}` не найден.", ephemeral=True)
         return
-
     set_npc(prefix, interaction.guild.id, None, is_bot=False)
-    await interaction.response.send_message(
-        f"🛑 **{row['name']}** больше не NPC — управляется только игроком.", ephemeral=True
-    )
+    await interaction.response.send_message(f"🛑 **{row['name']}** больше не NPC.", ephemeral=True)
 
 
 @tree.command(name="jb_npc_status", description="Список активных NPC (только админ)")
@@ -1451,120 +1481,95 @@ async def jb_npc_status(interaction: discord.Interaction):
     if not interaction.guild or not is_admin(interaction):
         await interaction.response.send_message("❌ Нужны права администратора.", ephemeral=True)
         return
-
     npcs = get_active_npcs(interaction.guild.id)
     if not npcs:
         await interaction.response.send_message("🤖 Активных NPC нет.", ephemeral=True)
         return
-
     now = time.time()
     lines = []
     for r in npcs:
         ch = interaction.guild.get_channel(r["npc_channel_id"])
-        ch_str = ch.mention if ch else "❓ канал удалён"
+        ch_str = ch.mention if ch else "❓"
         since = int(now - (r["npc_last_spoke"] or 0))
-        talk_count = r["npc_talk_count"] or 0
-        lines.append(f"🤖 **{r['name']}** — {ch_str} — молчал {since} сек — реплик подряд: {talk_count}")
-
-    embed = discord.Embed(
-        title=f"🤖 Активные NPC ({len(npcs)})",
-        description="\n".join(lines),
-        color=0x9B59B6,
-    )
+        down_mark = " ☠️" if r["is_down"] else ""
+        lines.append(f"🤖 **{r['name']}**{down_mark} — {ch_str} — {since} сек")
+    embed = discord.Embed(title=f"🤖 NPC ({len(npcs)})", description="\n".join(lines), color=0x9B59B6)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-# ---------- Обработка сообщения ----------
+# ---------- Обработка ----------
 async def send_as_character(channel, name, avatar_url, text):
     webhook = await get_webhook(channel)
     await webhook.send(content=text, username=name, avatar_url=avatar_url)
 
 
 async def npc_speak(guild, row, text, is_action):
-    channel_id = row["npc_channel_id"]
-    channel = guild.get_channel(channel_id)
+    channel = guild.get_channel(row["npc_channel_id"])
     if not channel:
         return
     try:
         await send_as_character(channel, row["name"], row["avatar_url"], text)
     except Exception as e:
-        print(f"⚠️ NPC вебхук error: {e}")
+        print(f"⚠️ NPC вебхук: {e}")
         return
     update_npc_spoke(guild.id, row["prefix"])
-    log_action(
-        guild.id, channel_id, row["name"], text,
-        "npc_action" if is_action else "npc_speech",
-    )
+    log_action(guild.id, channel.id, row["name"], text,
+               "npc_action" if is_action else "npc_speech")
 
 
 async def npc_move(guild, row, target_channel, reason):
     current_channel = guild.get_channel(row["npc_channel_id"])
     if not current_channel:
         return
-
     if reason:
         try:
-            await send_as_character(
-                current_channel, row["name"], row["avatar_url"],
-                f"*{reason}*",
-            )
+            await send_as_character(current_channel, row["name"], row["avatar_url"], f"*{reason}*")
         except Exception as e:
-            print(f"⚠️ Ошибка прощания: {e}")
-
+            print(f"⚠️ {e}")
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute(
-        "UPDATE characters SET npc_channel_id=?, npc_last_moved=?, npc_talk_count=0 "
-        "WHERE guild_id=? AND prefix=?",
-        (target_channel.id, time.time(), guild.id, row["prefix"]),
-    )
+    c.execute("UPDATE characters SET npc_channel_id=?, npc_last_moved=?, npc_talk_count=0 "
+              "WHERE guild_id=? AND prefix=?",
+              (target_channel.id, time.time(), guild.id, row["prefix"]))
     conn.commit()
     conn.close()
-
     try:
-        await send_as_character(
-            target_channel, row["name"], row["avatar_url"],
-            f"*вошёл в {target_channel.name}*",
-        )
+        await send_as_character(target_channel, row["name"], row["avatar_url"], f"*вошёл в {target_channel.name}*")
     except Exception as e:
-        print(f"⚠️ Ошибка приветствия: {e}")
-
-    log_action(
-        guild.id, current_channel.id, row["name"],
-        f"ушёл из {current_channel.name}",
-        f"→ {target_channel.name}",
-    )
-    log_action(
-        guild.id, target_channel.id, row["name"],
-        f"пришёл в {target_channel.name}",
-        "npc_move",
-    )
+        print(f"⚠️ {e}")
+    log_action(guild.id, target_channel.id, row["name"], "пришёл", "npc_move")
 
 
 async def handle_message(message, prefix, text, owner_id, char_name, avatar_url):
     guild_id = message.guild.id
-
     row = get_character(user_id=owner_id, guild_id=guild_id, prefix=prefix)
     if not row:
+        return
+
+    if row["is_down"]:
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        try:
+            await message.channel.send(
+                f"☠️ **{char_name}** без сознания. Используй `/jb_revive`."
+            )
+        except Exception:
+            pass
+        log_action(guild_id, message.channel.id, char_name, text, "down_attempt")
         return
 
     history = row["history"] or ""
     personality = row["personality"] or ""
     inventory = json.loads(row["inventory"] or "[]")
     skills = json.loads(row["skills"] or "[]")
-
     context_log = get_recent_log(guild_id, message.channel.id, limit=10)
-
     others = get_chars_for_guild(guild_id)
-    targets_info = [
-        f"{n} (префикс {p})" for p, u, n, a in others if n.lower() != char_name.lower()
-    ]
+    targets_info = [f"{n} (префикс {p})" for p, u, n, a in others if n.lower() != char_name.lower()]
 
-    result = await resolve_action(
-        char_name, history, personality, skills, inventory,
-        text, context_log, targets_info,
-    )
-
+    result = await resolve_action(char_name, history, personality, skills, inventory,
+                                  text, context_log, targets_info)
     is_action = bool(result.get("is_action"))
     narration = (result.get("narration") or "").strip()
     target_name = result.get("target")
@@ -1574,19 +1579,16 @@ async def handle_message(message, prefix, text, owner_id, char_name, avatar_url)
     try:
         await send_as_character(message.channel, char_name, avatar_url, text)
     except Exception as e:
-        print(f"⚠️ Ошибка вебхука: {e}")
+        print(f"⚠️ {e}")
         return
-
     try:
         await message.delete()
     except Exception as e:
-        print(f"⚠️ Ошибка удаления: {e}")
+        print(f"⚠️ {e}")
 
     if is_action and narration:
-        embed = discord.Embed(
-            description=f"🎲 **{narration}**",
-            color=0xE67E22 if success else 0xE74C3C,
-        )
+        embed = discord.Embed(description=f"🎲 **{narration}**",
+                              color=0xE67E22 if success else 0xE74C3C)
         embed.set_author(name=f"Мастер: {char_name}")
         await message.channel.send(embed=embed)
 
@@ -1595,19 +1597,21 @@ async def handle_message(message, prefix, text, owner_id, char_name, avatar_url)
             if target_row:
                 new_hp = max(0, target_row["health"] - damage)
                 update_health(guild_id, target_row["name"], new_hp)
+                was_down = bool(target_row["is_down"])
+                became_down = new_hp <= 0 and not was_down
+                if became_down:
+                    set_down(guild_id, target_row["name"], True)
                 hp_embed = discord.Embed(
                     title=f"⚔️ {target_row['name']} получает {damage} урона",
                     description=f"Осталось HP: **{new_hp} / {target_row['max_health']}**",
                     color=0xE74C3C,
                 )
-                if new_hp <= 0:
-                    hp_embed.description += "\n☠️ **Персонаж повержен!**"
+                if became_down:
+                    hp_embed.description += "\n\n☠️ **Персонаж повержен!**"
                 await message.channel.send(embed=hp_embed)
 
-    log_action(
-        guild_id, message.channel.id, char_name, text,
-        narration or ("речь" if not is_action else "")
-    )
+    log_action(guild_id, message.channel.id, char_name, text,
+               narration or ("речь" if not is_action else ""))
 
 
 @bot.event
@@ -1616,17 +1620,14 @@ async def on_message(message: discord.Message):
         return
     if not is_channel_allowed(message.guild.id, message.channel.id):
         return
-
     match = find_by_prefix(message.content, message.guild.id)
     if not match:
         return
-
     prefix, text, owner_id, char_name, avatar_url = match
     if message.author.id != owner_id:
         return
     if not text:
         return
-
     try:
         await handle_message(message, prefix, text, owner_id, char_name, avatar_url)
     except Exception as e:
